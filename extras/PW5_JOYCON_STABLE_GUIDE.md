@@ -105,6 +105,19 @@ For the tested right Joy-Con descriptor:
 The plugin only opens an already-created KOReader joystick input node. It does not
 start Bluetooth, create the HID API, install KBM, or modify system startup.
 
+### KOReader safety menu
+
+The plugin registers `Joy-Con & Kindle Tools` in KOReader's main menu. It provides:
+
+- current API version, daemon state, and live connections;
+- Start and Stop for an API process that is already resident;
+- guarded Restart, which starts only after PARKED was verified;
+- a read-only incident-snapshot launcher.
+
+The menu deliberately has no fresh API creation, pairing, Full Stop, native
+Bluetooth toggle, autostart, or reboot action. If port 8321 is absent or belongs to
+an unexpected version, it refuses to mutate Bluetooth state.
+
 ## Normal daily use
 
 - Keep the API resident and avoid USB drive mode.
