@@ -10,7 +10,8 @@ Port 8321 on localhost.
 /status shape:
     {
       "ok": true, "version": "...",
-      "daemon_running": bool, "scanning": bool, "pairing": bool,
+      "daemon_running": bool, "bt_prepared": bool,
+      "scanning": bool, "pairing": bool,
       "devices": [{"address", "protocol", "name"?}, ...],   # devices.conf
       "device_count": int,
       "connections": [                                      # live sessions

@@ -30,6 +30,7 @@ class HIDDaemon:
 
     def __init__(self):
         self.running = False
+        self.bt_prepared = False
         self.host = None
         self._host_task = None
         self._suspended = False
@@ -37,6 +38,20 @@ class HIDDaemon:
         self._paired_host = None
         # Set in main(): called with True/False as a pointer device connects/leaves.
         self.on_pointer_change = None
+
+    def ensure_bt_prepared(self):
+        """Prepare Bluetooth once, immediately before the first BT operation.
+
+        Keeping this out of daemon startup lets the local API run with no
+        configured devices without opening or evicting holders of the HCI
+        transport. Pair, scan, and normal connection paths call this method
+        before touching the chip.
+        """
+        if self.bt_prepared:
+            return
+        if not prepare_bt():
+            raise RuntimeError("Bluetooth hardware preparation failed")
+        self.bt_prepared = True
 
     @property
     def connection_state(self) -> dict:
@@ -83,6 +98,7 @@ class HIDDaemon:
 
     async def scan(self, duration=10.0, on_device_found=None):
         """Scan for BT devices. Must be called while suspended."""
+        self.ensure_bt_prepared()
         scanner = Scanner()
         if on_device_found:
             scanner.on_device_found = on_device_found
@@ -94,6 +110,7 @@ class HIDDaemon:
 
     async def pair(self, address, protocol, name=None) -> bool:
         """Pair with a device. Must be called while suspended."""
+        self.ensure_bt_prepared()
         host = HIDHost()
         try:
             success = await host.pair_device(address, protocol, name)
@@ -164,6 +181,7 @@ class HIDDaemon:
                     break
                 continue
 
+            self.ensure_bt_prepared()
             chip().ensure_powered()
 
             try:
@@ -248,8 +266,6 @@ async def main():
     # Devices paired before the mapper was installed (or before this existed)
     # get their block on the next daemon start.
     button_mapper.register_all(config.get_all_devices())
-
-    prepare_bt()
 
     daemon = HIDDaemon()
     controller = DaemonController(daemon)

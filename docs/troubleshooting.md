@@ -31,6 +31,11 @@ KINDLE_HID_DEBUG=1 /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --daemo
 /mnt/us/kindle_hid_passthrough/kindle-hid-passthrough --pair
 ```
 
+When the daemon starts with no configured devices, its localhost API starts
+without preparing or opening the Bluetooth transport. `/status` reports
+`"bt_prepared": false` in that state. The first scan, pair, or configured-device
+connection prepares Bluetooth and changes the field to `true`.
+
 ### Device Configuration
 
 Paired devices are stored in `devices.conf`:

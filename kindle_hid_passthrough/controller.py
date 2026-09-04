@@ -61,6 +61,7 @@ class DaemonController:
 
         status = {
             "daemon_running": self.bt_enabled and self.daemon.running,
+            "bt_prepared": self.daemon.bt_prepared,
             "devices": devices,
             "device_count": len(devices),
             "scanning": self.is_scanning,
@@ -143,6 +144,7 @@ class DaemonController:
                 await self.daemon.suspend()
                 config.validate_keystore()
 
+                self.daemon.ensure_bt_prepared()
                 # Re-warm the chip if a prior /stop powered it off; opening the
                 # transport against a cold chip makes HCI Reset time out.
                 chip().ensure_powered()
@@ -180,6 +182,7 @@ class DaemonController:
                 await self.daemon.suspend()
                 config.validate_keystore()
 
+                self.daemon.ensure_bt_prepared()
                 # Re-warm the chip if a prior /stop powered it off; opening the
                 # transport against a cold chip makes HCI Reset time out.
                 chip().ensure_powered()
