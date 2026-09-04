@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Kindle Tools</title>
+<style>
+html, body { margin:0; padding:0; background:#fff; color:#000; font-family:Arial, sans-serif; }
+.wrap { padding:26px 24px 40px 24px; }
+h1 { font-size:34px; margin:0 0 8px 0; }
+.sub { font-size:18px; margin:0 0 24px 0; }
+h2 { font-size:23px; margin:28px 0 12px 0; border-bottom:2px solid #000; padding-bottom:7px; }
+button { display:block; width:100%; box-sizing:border-box; font-size:23px; text-align:left; background:#fff; color:#000; border:2px solid #000; border-radius:5px; padding:18px 16px; margin:10px 0; }
+button:active { background:#ddd; }
+#status { margin-top:24px; min-height:30px; font-size:18px; font-weight:bold; }
+</style>
+<script>
+var sent = {};
+function pending() { document.getElementById('status').innerHTML = 'Not connected yet. No action was run.'; }
+function diagnostic(action, label) {
+    if (sent[action]) { document.getElementById('status').innerHTML = label + ' already requested in this session.'; return; }
+    sent[action] = true;
+    var requestImage = new Image();
+    requestImage.src = 'http://127.0.0.1:8322/' + action + '?t=' + new Date().getTime();
+    document.getElementById('status').innerHTML = label + ' requested.';
+}
+</script>
+</head>
+<body><div class="wrap">
+<h1>Kindle Tools</h1><p class="sub">HID / Diagnostics / Recovery</p>
+<h2>Page Turner</h2>
+<button onclick="diagnostic('on','Start daemon')">Start daemon</button><button onclick="diagnostic('off','Stop daemon')">Stop daemon</button><button onclick="diagnostic('restart-existing','Restart daemon')">Restart daemon</button>
+<button onclick="diagnostic('pair-joycon-once','JOY-CON pair once')">JOY-CON — Pair Joy-Con (R) once</button>
+<h2>Diagnostics</h2>
+<button onclick="diagnostic('status','Status')">Show status</button>
+<button onclick="diagnostic('snapshot','Snapshot')">Save incident snapshot</button>
+<button onclick="diagnostic('mtk-preflight','MTK preflight')">MTK preflight (read-only)</button>
+<h2>Recovery</h2>
+<button onclick="diagnostic('full-stop','HID full stop')">HID full stop</button>
+<button onclick="diagnostic('arm-create','Saved-device API armed')">1. Arm saved-device API (60 seconds)</button>
+<button onclick="diagnostic('create-api','Saved-device API creation')">2. Create API for saved devices</button>
+<h2>Display</h2>
+<button onclick="diagnostic('force-day','Restore day mode')">Restore day mode</button>
+<p id="status">API creation uses the verified KeyKey + Joy-Con saved-device configuration.</p>
+</div></body>
+</html>
