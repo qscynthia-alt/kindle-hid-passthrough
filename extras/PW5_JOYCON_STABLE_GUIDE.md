@@ -98,9 +98,9 @@ abnormal, stop. Do not retry in the same runtime state.
 For the tested right Joy-Con descriptor:
 
 - physical A (`BtnA`) -> previous page
+- physical B (`BtnC`) -> previous page
 - physical X (`BtnB`) -> next page
-- physical B (`BtnC`) -> no page action
-- physical Y (`BtnX`) -> no page action
+- physical Y (`BtnX`) -> next page
 
 The plugin only opens an already-created KOReader joystick input node. It does not
 start Bluetooth, create the HID API, install KBM, or modify system startup.
@@ -110,6 +110,8 @@ start Bluetooth, create the HID API, install KBM, or modify system startup.
 The plugin registers `Joy-Con & Kindle Tools` in KOReader's main menu. It provides:
 
 - current API version, daemon state, and live connections;
+- a transport-preserving Joy-Con retry that only interrupts the current Classic
+  page attempt and wakes the existing paging loop;
 - Start and Stop for an API process that is already resident;
 - guarded Restart, which starts only after PARKED was verified;
 - a read-only incident-snapshot launcher.

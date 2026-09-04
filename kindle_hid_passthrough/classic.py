@@ -139,6 +139,7 @@ class ClassicMixin:
 
     async def _run_classic_handler(self):
         """Handle Classic Bluetooth connections."""
+        self._classic_retry_event = asyncio.Event()
         if hasattr(self, '_classic_connection_listener') and self._classic_connection_listener:
             try:
                 self.device.remove_listener('connection', self._classic_connection_listener)
@@ -187,6 +188,29 @@ class ClassicMixin:
         self.device.on('connection', on_connection_event)
 
         await self._classic_active_connect_loop()
+
+    def retry_classic_connection(self):
+        """Interrupt only the current Classic page wait and retry immediately.
+
+        This deliberately leaves the controller, transport, PSM servers, page
+        scan, and HIDHost alive.  It must not be implemented by cancelling the
+        classic handler because that would unwind HIDHost and close /dev/stpbt.
+        """
+        event = getattr(self, '_classic_retry_event', None)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    async def _classic_retry_sleep(self, delay):
+        """Sleep until the next normal attempt, or consume a manual retry."""
+        event = self._classic_retry_event
+        try:
+            await asyncio.wait_for(event.wait(), timeout=delay)
+            event.clear()
+            log.info("[Classic] Manual retry requested")
+        except asyncio.TimeoutError:
+            pass
 
     async def _setup_classic_session(self, session, old=None):
         """Authenticate, open HID channels, and finalize one Classic session."""
@@ -269,6 +293,7 @@ class ClassicMixin:
         attempt = 0
         while True:
             attempt += 1
+            manual_retry = False
             addresses = [d.address for d in self.classic_devices if d.address != '*']
             for addr in addresses:
                 if normalize_addr(addr) in self.sessions:
@@ -281,24 +306,35 @@ class ClassicMixin:
                 connect_task = asyncio.create_task(
                     self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                 )
+                retry_task = asyncio.create_task(self._classic_retry_event.wait())
                 # The finally below guarantees connect_task is cancelled and
                 # awaited on every exit path, including suspend cancellation,
                 # otherwise it leaks and asyncio logs an unretrieved exception
                 # when bumble eventually raises HCI_PAGE_TIMEOUT.
                 try:
                     timed_out = True
+                    retry_requested = False
                     for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
-                        done, _ = await asyncio.wait([connect_task], timeout=0.5)
-                        if done:
+                        done, _ = await asyncio.wait(
+                            [connect_task, retry_task], timeout=0.5,
+                            return_when=asyncio.FIRST_COMPLETED)
+                        if retry_task in done:
+                            self._classic_retry_event.clear()
+                            retry_requested = True
+                            timed_out = False
+                            break
+                        if connect_task in done:
                             timed_out = False
                             break
 
-                    if timed_out:
+                    if retry_requested:
+                        log.info(f"[Classic] Retrying {addr} on manual request")
+                        manual_retry = True
+                    elif timed_out:
                         log.info(f"[Classic] {addr} timed out")
                         await asyncio.sleep(3.0)
-                        continue
-
-                    await connect_task
+                    else:
+                        await connect_task
 
                 except Exception as e:
                     msg = str(e)
@@ -319,14 +355,26 @@ class ClassicMixin:
                         await connect_task
                     except (asyncio.CancelledError, Exception):
                         pass
+                    if not retry_task.done():
+                        retry_task.cancel()
+                    try:
+                        await retry_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
                     self._radio_lock.release()
+
+                if manual_retry:
+                    break
+
+            if manual_retry:
+                continue
 
             # Page scan catches powered-on devices instantly; active paging is
             # the fallback, so with live links yield the radio to them and wifi.
             if self.sessions:
-                await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL_CONNECTED)
+                await self._classic_retry_sleep(self.ACTIVE_RETRY_INTERVAL_CONNECTED)
             else:
-                await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+                await self._classic_retry_sleep(self.ACTIVE_RETRY_INTERVAL)
 
     def _classic_set_report_protocol(self, session):
         """Send HIDP SET_PROTOCOL(Report) on the control channel."""

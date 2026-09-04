@@ -20,6 +20,9 @@ Port 8321 on localhost.
 
 /disconnect takes an optional addr param: with it, only that device's
 session is dropped; without it, every session is dropped.
+
+/retry-classic interrupts the current Classic page wait and wakes the existing
+paging loop without suspending HIDHost or closing the Bluetooth transport.
 """
 
 import json
@@ -106,6 +109,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_pair_status()
             case '/connect':
                 self._handle_connect(param('addr'), param('protocol'))
+            case '/retry-classic':
+                self._handle_retry_classic()
             case '/disconnect':
                 self._handle_disconnect(param('addr'))
             case '/discoverable':
@@ -241,6 +246,14 @@ class RequestHandler(BaseHTTPRequestHandler):
 
         controller.request_connect(address, protocol_str or 'ble')
         self._send_json({"ok": True, "message": f"Connecting to {address}"})
+
+    def _handle_retry_classic(self):
+        if self._controller.request_retry_classic():
+            self._send_json({"ok": True,
+                             "message": "Classic connection retry requested"})
+        else:
+            self._send_json({"ok": False,
+                             "error": "Classic retry loop is not active"})
 
     def _handle_disconnect(self, address=None):
         controller = self._controller

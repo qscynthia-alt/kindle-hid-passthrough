@@ -108,9 +108,11 @@ function JoyConProbe:_status()
     if not body then return nil, err end
     local ok, data = pcall(rapidjson.decode, body)
     if not ok or type(data) ~= "table" then return nil, "invalid status response" end
-    if data.version ~= "3.15.2-a4175a9" then
-        return nil, "unexpected API version"
+    local trusted = data.version == "3.15.2-a4175a9"
+    for _, capability in ipairs(data.capabilities or {}) do
+        if capability == "retry_classic" then trusted = true end
     end
+    if not trusted then return nil, "untrusted API version" end
     return data
 end
 
@@ -162,6 +164,20 @@ function JoyConProbe:startExistingApi()
         return
     end
     self:_verifyLater(true, "Existing API daemon started")
+end
+
+function JoyConProbe:retryJoyConConnection()
+    local data = self:_status()
+    if not data or not data.daemon_running then
+        self:_show("Running API required; nothing was changed", 5)
+        return
+    end
+    local body, request_err = self:_httpGet("/retry-classic")
+    if request_err or not body or not body:find('"ok"%s*:%s*true') then
+        self:_show("Classic retry was not accepted; nothing else was reset", 5)
+        return
+    end
+    self:_show("Joy-Con connection retry requested")
 end
 
 function JoyConProbe:stopExistingApi()
@@ -238,13 +254,13 @@ function JoyConProbe:onJoyConButton(name)
 end
 
 function JoyConProbe:onJoyConPrevious()
-    logger.info("JoyConProbe: physical A (BtnA) -> previous page")
+    logger.info("JoyConProbe: previous page")
     self.ui:handleEvent(Event:new("GotoViewRel", -1))
     return true
 end
 
 function JoyConProbe:onJoyConNext()
-    logger.info("JoyConProbe: physical X (BtnB) -> next page")
+    logger.info("JoyConProbe: next page")
     self.ui:handleEvent(Event:new("GotoViewRel", 1))
     return true
 end
@@ -257,9 +273,12 @@ function JoyConProbe:init()
         }
     end
     -- Verified on this Joy-Con/HID descriptor:
-    -- physical A -> BtnA, X -> BtnB, B -> BtnC, Y -> BtnX.
+    -- Verified descriptor: physical A -> BtnA, X -> BtnB,
+    -- B -> BtnC, Y -> BtnX. Pair both sides for button wear sharing.
     self.key_events.ProbeBtnA = { { "BtnA" }, event = "JoyConPrevious" }
     self.key_events.ProbeBtnB = { { "BtnB" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnC = { { "BtnC" }, event = "JoyConPrevious" }
+    self.key_events.ProbeBtnX = { { "BtnX" }, event = "JoyConNext" }
     if self.ui.active_widgets then table.insert(self.ui.active_widgets, self) end
     if self.ui.menu then self.ui.menu:registerToMainMenu(self) end
     logger.info("JoyConProbe: init")
@@ -281,6 +300,11 @@ function JoyConProbe:addToMainMenu(menu_items)
                 text = "Start existing API daemon",
                 keep_menu_open = true,
                 callback = function() self:startExistingApi() end,
+            },
+            {
+                text = "Retry Joy-Con connection",
+                keep_menu_open = true,
+                callback = function() self:retryJoyConConnection() end,
             },
             {
                 text = "Stop existing API daemon…",

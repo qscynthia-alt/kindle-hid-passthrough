@@ -18,6 +18,7 @@ class FakeDaemon:
         self._suspended = False
         self.running = True
         self.calls = []
+        self.host = None
 
     async def suspend(self):
         self.calls.append('suspend')
@@ -84,6 +85,37 @@ def test_mtk_resumes_once_when_both_wake_events_arrive():
 def test_mtk_resumes_when_only_the_screensaver_wake_arrives():
     daemon, _ = drive(True, ['readyToSuspend', 'outOfScreenSaver'])
     assert daemon.calls == ['suspend', 'resume'], daemon.calls
+
+
+def test_classic_retry_only_signals_live_host():
+    class FakeHost:
+        def __init__(self):
+            self.calls = []
+
+        def retry_classic_connection(self):
+            self.calls.append('retry_classic')
+            return True
+
+    async def run():
+        daemon = FakeDaemon()
+        daemon.host = FakeHost()
+        ctrl = DaemonController(daemon)
+        assert await ctrl._do_retry_classic() is True
+        assert daemon.host.calls == ['retry_classic']
+        assert daemon.calls == []
+
+    asyncio.run(run())
+
+
+def test_classic_retry_refuses_suspended_daemon():
+    async def run():
+        daemon = FakeDaemon()
+        daemon._suspended = True
+        ctrl = DaemonController(daemon)
+        assert await ctrl._do_retry_classic() is False
+        assert daemon.calls == []
+
+    asyncio.run(run())
 
 
 def main():
