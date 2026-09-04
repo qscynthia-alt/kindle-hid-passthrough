@@ -1,0 +1,78 @@
+name: Build deferred-BT ARM test artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit to build
+        required: true
+        default: codex/defer-bt-prepare
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ARMv7 core only
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Stamp build revision
+        shell: bash
+        run: |
+          short_sha="$(git rev-parse --short HEAD)"
+          printf '%s\n' "$short_sha" > kindle_hid_passthrough/BUILD_SHA
+          sed -i "s/^__build_sha__ = None/__build_sha__ = \"${short_sha}\"/" \
+            kindle_hid_passthrough/config.py
+
+      - name: Build ARMv7 core
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .github/Dockerfile.arm
+          platforms: linux/arm/v7
+          tags: kindle-hid-passthrough-deferred-bt-builder
+          load: true
+
+      - name: Extract core files
+        shell: bash
+        run: |
+          container_id="$(docker create kindle-hid-passthrough-deferred-bt-builder)"
+          mkdir -p artifact/dist
+          docker cp "$container_id:/build/kindle-hid-passthrough" \
+            artifact/kindle-hid-passthrough
+          docker cp "$container_id:/build/libsyscall_wrapper.so" \
+            artifact/libsyscall_wrapper.so
+          docker cp "$container_id:/build/nuitka-out/main.dist/." artifact/dist/
+          docker rm "$container_id"
+          chmod +x artifact/kindle-hid-passthrough \
+            artifact/dist/main.bin artifact/dist/ld-linux-armhf.so.3
+          find artifact -type f -print0 | sort -z | xargs -0 sha256sum \
+            > artifact/SHA256SUMS
+
+      - name: Verify artifact shape
+        shell: bash
+        run: |
+          test -x artifact/kindle-hid-passthrough
+          test -f artifact/libsyscall_wrapper.so
+          test -x artifact/dist/main.bin
+          test -x artifact/dist/ld-linux-armhf.so.3
+          file artifact/kindle-hid-passthrough artifact/dist/main.bin \
+            artifact/dist/ld-linux-armhf.so.3
+          grep -q 'ARM' <(file artifact/kindle-hid-passthrough)
+          grep -q 'ARM' <(file artifact/dist/main.bin)
+
+      - name: Upload core artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: deferred-bt-armv7-core
+          path: artifact/
+          if-no-files-found: error
