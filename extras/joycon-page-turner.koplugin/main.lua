@@ -280,7 +280,6 @@ function JoyConProbe:init()
     self.key_events.ProbeBtnC = { { "BtnC" }, event = "JoyConPrevious" }
     self.key_events.ProbeBtnX = { { "BtnX" }, event = "JoyConNext" }
     if self.ui.active_widgets then table.insert(self.ui.active_widgets, self) end
-    if self.ui.menu then self.ui.menu:registerToMainMenu(self) end
     logger.info("JoyConProbe: init")
     extendEventMap()
     self:_scan()
