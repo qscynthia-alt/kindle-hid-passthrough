@@ -299,11 +299,6 @@ class ClassicMixin:
                 if normalize_addr(addr) in self.sessions:
                     continue
 
-                # A manual retry advances to the next missing Classic device.
-                # Reset this per target so retrying R can immediately try L,
-                # while retrying the last target starts a fresh cycle below.
-                manual_retry = False
-
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
@@ -369,7 +364,7 @@ class ClassicMixin:
                     self._radio_lock.release()
 
                 if manual_retry:
-                    continue
+                    break
 
             if manual_retry:
                 continue
