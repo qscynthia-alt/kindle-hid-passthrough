@@ -76,9 +76,10 @@ stock_bt_ready() {
 
 validate_creation_config() {
     active=$(grep -v '^[[:space:]]*#' "$BASE/devices.conf" 2>/dev/null | grep -v '^[[:space:]]*$')
-    [ "$(printf '%s\n' "$active" | wc -l | tr -d ' ')" = 2 ] || return 1
+    [ "$(printf '%s\n' "$active" | wc -l | tr -d ' ')" = 3 ] || return 1
     printf '%s\n' "$active" | grep -Eq '^[0-9A-Fa-f:]{17}[[:space:]]+ble[[:space:]]+KeyKey Mini BLE1$' || return 1
     printf '%s\n' "$active" | grep -Eq '^[0-9A-Fa-f:]{17}[[:space:]]+classic[[:space:]]+Joy-Con \(R\)$' || return 1
+    printf '%s\n' "$active" | grep -Eq '^[0-9A-Fa-f:]{17}[[:space:]]+classic[[:space:]]+Joy-Con \(L\)$' || return 1
     grep -Eq '^connect_timeout[[:space:]]*=[[:space:]]*120[[:space:]]*$' "$BASE/config.ini"
 }
 

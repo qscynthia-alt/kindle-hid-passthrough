@@ -279,6 +279,12 @@ function JoyConProbe:init()
     self.key_events.ProbeBtnB = { { "BtnB" }, event = "JoyConNext" }
     self.key_events.ProbeBtnC = { { "BtnC" }, event = "JoyConPrevious" }
     self.key_events.ProbeBtnX = { { "BtnX" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnThumbR = { { "BtnThumbR" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnY = { { "BtnY" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnZ = { { "BtnZ" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnTL2 = { { "BtnTL2" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnThumbL = { { "BtnThumbL" }, event = "JoyConNext" }
+    self.key_events.ProbeBtnMode = { { "BtnMode" }, event = "JoyConNext" }
     if self.ui.active_widgets then table.insert(self.ui.active_widgets, self) end
     logger.info("JoyConProbe: init")
     extendEventMap()
