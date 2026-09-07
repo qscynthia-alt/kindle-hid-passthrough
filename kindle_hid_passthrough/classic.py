@@ -140,6 +140,7 @@ class ClassicMixin:
     async def _run_classic_handler(self):
         """Handle Classic Bluetooth connections."""
         self._classic_retry_event = asyncio.Event()
+        self._classic_preferred_address = None
         if hasattr(self, '_classic_connection_listener') and self._classic_connection_listener:
             try:
                 self.device.remove_listener('connection', self._classic_connection_listener)
@@ -189,7 +190,7 @@ class ClassicMixin:
 
         await self._classic_active_connect_loop()
 
-    def retry_classic_connection(self):
+    def retry_classic_connection(self, address=None):
         """Interrupt only the current Classic page wait and retry immediately.
 
         This deliberately leaves the controller, transport, PSM servers, page
@@ -199,6 +200,13 @@ class ClassicMixin:
         event = getattr(self, '_classic_retry_event', None)
         if event is None:
             return False
+        if address is not None:
+            target = normalize_addr(address)
+            allowed = {normalize_addr(d.address) for d in self.classic_devices
+                       if d.address != '*'}
+            if target not in allowed:
+                return False
+            self._classic_preferred_address = target
         event.set()
         return True
 
@@ -264,6 +272,7 @@ class ClassicMixin:
             await self._query_classic_sdp(session)
 
         self._finalize_classic_hid(session)
+        self._classic_preferred_address = normalize_addr(session.address)
         log.success(f"[Classic] {self._format_device(session.address)} receiving HID reports")
 
     def _is_classic_allowed(self, addr_str: str) -> bool:
@@ -295,6 +304,9 @@ class ClassicMixin:
             attempt += 1
             manual_retry = False
             addresses = [d.address for d in self.classic_devices if d.address != '*']
+            preferred = getattr(self, '_classic_preferred_address', None)
+            if preferred:
+                addresses.sort(key=lambda addr: normalize_addr(addr) != preferred)
             for addr in addresses:
                 if normalize_addr(addr) in self.sessions:
                     continue

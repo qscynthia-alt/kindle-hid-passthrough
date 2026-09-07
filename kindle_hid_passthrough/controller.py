@@ -224,24 +224,26 @@ class DaemonController:
             if self.daemon._suspended:
                 await self.daemon.resume()
 
-    def request_retry_classic(self):
+    def request_retry_classic(self, address=None):
         """Wake only the live HIDHost's Classic paging loop."""
         future = asyncio.run_coroutine_threadsafe(
-            self._do_retry_classic(), self.loop)
+            self._do_retry_classic(address), self.loop)
         try:
             return future.result(timeout=2.0)
         except Exception as e:
             logger.error(f"Classic retry request failed: {errstr(e)}")
             return False
 
-    async def _do_retry_classic(self):
+    async def _do_retry_classic(self, address=None):
         async with self._op_lock:
             if self.daemon._suspended or not self.daemon.running:
                 return False
             host = self.daemon.host
             if host is None or not hasattr(host, 'retry_classic_connection'):
                 return False
-            return host.retry_classic_connection()
+            if address is None:
+                return host.retry_classic_connection()
+            return host.retry_classic_connection(address)
 
     async def _do_connect(self, address, protocol):
         async with self._op_lock:

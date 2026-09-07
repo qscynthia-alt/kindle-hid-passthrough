@@ -130,6 +130,17 @@ api_action() {
 case "$ACTION" in
     on) api_action start true ;;
     off) api_action stop false ;;
+    connect-joycon-r|connect-joycon-l)
+        get_status "$OUT/status-before.json" || { alert "API unavailable; nothing was changed"; exit 1; }
+        suffix=R; [ "$ACTION" = connect-joycon-l ] && suffix=L
+        addr=$(awk -v n="Joy-Con ($suffix)" '$2 == "classic" && index($0, n) { print $1; exit }' "$BASE/devices.conf")
+        [ -n "$addr" ] || { alert "Saved Joy-Con ($suffix) not found"; exit 1; }
+        curl --noproxy '*' -fsS --connect-timeout 1 --max-time 5 \
+            "http://127.0.0.1:8321/retry-classic?addr=$addr" >"$OUT/response.json" 2>>"$OUT/api-errors.log" || {
+            alert "Connect request uncertain; not retried"; exit 1; }
+        grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$OUT/response.json" || { alert "Connect request refused"; exit 1; }
+        alert "Connecting Joy-Con ($suffix)…"
+        ;;
     mtk-preflight)
         REPORT="$OUT/mtk-preflight.txt"
         {

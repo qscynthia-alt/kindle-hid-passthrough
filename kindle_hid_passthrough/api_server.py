@@ -110,7 +110,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             case '/connect':
                 self._handle_connect(param('addr'), param('protocol'))
             case '/retry-classic':
-                self._handle_retry_classic()
+                self._handle_retry_classic(param('addr'))
             case '/disconnect':
                 self._handle_disconnect(param('addr'))
             case '/discoverable':
@@ -247,8 +247,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         controller.request_connect(address, protocol_str or 'ble')
         self._send_json({"ok": True, "message": f"Connecting to {address}"})
 
-    def _handle_retry_classic(self):
-        if self._controller.request_retry_classic():
+    def _handle_retry_classic(self, address=None):
+        if self._controller.request_retry_classic(address):
             self._send_json({"ok": True,
                              "message": "Classic connection retry requested"})
         else:

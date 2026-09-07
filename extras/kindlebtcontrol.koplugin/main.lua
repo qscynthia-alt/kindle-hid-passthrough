@@ -1,4 +1,5 @@
 local ConfirmBox = require("ui/widget/confirmbox")
+local ButtonDialog = require("ui/widget/buttondialog")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
@@ -178,6 +179,37 @@ function BluetoothControl:retryConnection()
     end
     self:_show("Bluetooth page-turner connection retry requested")
     UIManager:scheduleIn(3, function() self:_status() end)
+end
+
+function BluetoothControl:chooseClassicDevice()
+    local data = self:_status()
+    if not data or not data.daemon_running then
+        self:_show("Running API required; nothing was changed", 5)
+        return
+    end
+    local buttons = {}
+    for _, dev in ipairs(type(data.devices) == "table" and data.devices or {}) do
+        if type(dev) == "table" and dev.protocol == "classic"
+                and type(dev.address) == "string" then
+            local address = dev.address
+            local name = type(dev.name) == "string" and dev.name or address
+            buttons[#buttons + 1] = {{ text = name, callback = function()
+                UIManager:close(self._connect_dialog)
+                self._connect_dialog = nil
+                local body, err = self:_httpGet("/retry-classic?addr=" .. urlEncode(address))
+                if err or not body or not body:find('"ok"%s*:%s*true') then
+                    self:_show("Targeted connection was not accepted", 5)
+                    return
+                end
+                self:_show("Connecting " .. name .. "…", 4)
+            end }}
+        end
+    end
+    buttons[#buttons + 1] = {{ text = "Cancel", callback = function()
+        UIManager:close(self._connect_dialog); self._connect_dialog = nil
+    end }}
+    self._connect_dialog = ButtonDialog:new{ title = "Connect Joy-Con", buttons = buttons }
+    UIManager:show(self._connect_dialog)
 end
 
 function BluetoothControl:onShowHIDStatus()
@@ -408,6 +440,8 @@ function BluetoothControl:addToMainMenu(menu_items)
               callback = function() self:startExistingApi() end },
             { text = "Retry page-turner connection", keep_menu_open = true,
               callback = function() self:retryConnection() end },
+            { text = "Connect Joy-Con…", keep_menu_open = true,
+              callback = function() self:chooseClassicDevice() end },
             {
                 text = "Pair Joy-Con (L)…", keep_menu_open = true,
                 callback = function() self:pairLeftJoyCon() end,
