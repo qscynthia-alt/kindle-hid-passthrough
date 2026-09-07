@@ -70,6 +70,7 @@ function JoyConProbe:_attach(path)
     input_fds[real_path] = Device.input:fdopen(fd, real_path, name)
     extendEventMap()
     logger.info("JoyConProbe: attached", name, real_path)
+    self:_show(name .. " connected", 3)
 end
 
 function JoyConProbe:_detach(path)

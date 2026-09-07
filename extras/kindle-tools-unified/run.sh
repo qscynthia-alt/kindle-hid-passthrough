@@ -88,17 +88,24 @@ connection_label() {
     connections=$(sed -n 's/.*"connections"[[:space:]]*:[[:space:]]*\[\(.*\)\][[:space:]]*,[[:space:]]*"ok".*/\1/p' "$json")
     [ -n "$connections" ] || { echo 'no device connected'; return; }
     has_keykey=no
-    has_joycon=no
+    has_joycon_r=no
+    has_joycon_l=no
     keykey_addr=$(awk '$2 == "ble" && index($0, "KeyKey Mini BLE1") { print $1; exit }' "$BASE/devices.conf")
-    joycon_addr=$(awk '$2 == "classic" && index($0, "Joy-Con (R)") { print $1; exit }' "$BASE/devices.conf")
+    joycon_r_addr=$(awk '$2 == "classic" && index($0, "Joy-Con (R)") { print $1; exit }' "$BASE/devices.conf")
+    joycon_l_addr=$(awk '$2 == "classic" && index($0, "Joy-Con (L)") { print $1; exit }' "$BASE/devices.conf")
     [ -n "$keykey_addr" ] && printf '%s' "$connections" | grep -qi "$keykey_addr" && has_keykey=yes
-    [ -n "$joycon_addr" ] && printf '%s' "$connections" | grep -qi "$joycon_addr" && has_joycon=yes
-    if [ "$has_keykey" = yes ] && [ "$has_joycon" = yes ]; then
+    [ -n "$joycon_r_addr" ] && printf '%s' "$connections" | grep -qi "$joycon_r_addr" && has_joycon_r=yes
+    [ -n "$joycon_l_addr" ] && printf '%s' "$connections" | grep -qi "$joycon_l_addr" && has_joycon_l=yes
+    if [ "$has_keykey" = yes ] && { [ "$has_joycon_r" = yes ] || [ "$has_joycon_l" = yes ]; }; then
         echo 'KeyKey + Joy-Con connected'
     elif [ "$has_keykey" = yes ]; then
         echo 'KeyKey connected'
-    elif [ "$has_joycon" = yes ]; then
-        echo 'Joy-Con connected'
+    elif [ "$has_joycon_r" = yes ] && [ "$has_joycon_l" = yes ]; then
+        echo 'Joy-Con (R) + Joy-Con (L) connected'
+    elif [ "$has_joycon_r" = yes ]; then
+        echo 'Joy-Con (R) connected'
+    elif [ "$has_joycon_l" = yes ]; then
+        echo 'Joy-Con (L) connected'
     else
         echo 'unknown device connected'
     fi
