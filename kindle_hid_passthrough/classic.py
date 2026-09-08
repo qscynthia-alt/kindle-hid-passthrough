@@ -308,8 +308,13 @@ class ClassicMixin:
             if preferred:
                 addresses.sort(key=lambda addr: normalize_addr(addr) != preferred)
             for addr in addresses:
-                if normalize_addr(addr) in self.sessions:
-                    continue
+                existing = self.sessions.get(normalize_addr(addr))
+                if existing is not None:
+                    if existing.is_alive():
+                        continue
+                    log.info(f"[Classic] Removing stale session before reconnect: "
+                             f"{self._format_device(addr)}")
+                    await self._teardown_session(existing)
 
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
