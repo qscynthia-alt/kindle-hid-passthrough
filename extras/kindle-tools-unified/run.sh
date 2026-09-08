@@ -140,6 +140,17 @@ case "$ACTION" in
             alert "Connect request uncertain; not retried"; exit 1; }
         grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' "$OUT/response.json" || { alert "Connect request refused"; exit 1; }
         alert "Connecting Joy-Con ($suffix)…"
+        i=0
+        while [ "$i" -lt 13 ]; do
+            sleep 2
+            if get_status "$OUT/status-check-$i.json" && grep -qi "$addr" "$OUT/status-check-$i.json"; then
+                alert "Joy-Con ($suffix) connected"
+                exit 0
+            fi
+            i=$((i + 1))
+        done
+        alert "Joy-Con ($suffix) connection failed"
+        exit 1
         ;;
     mtk-preflight)
         REPORT="$OUT/mtk-preflight.txt"

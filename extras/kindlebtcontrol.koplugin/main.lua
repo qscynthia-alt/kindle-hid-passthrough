@@ -172,13 +172,40 @@ function BluetoothControl:retryConnection()
         self:_show("Running API required; nothing was changed", 5)
         return
     end
-    local body, err = self:_httpGet("/retry-classic")
-    if err or not body or not body:find('"ok"%s*:%s*true') then
+    local result, err = self:_json("/retry-classic")
+    if err or not result or result.ok ~= true or type(result.address) ~= "string" then
         self:_show("Connection retry was not accepted; nothing else was reset", 5)
         return
     end
-    self:_show("Bluetooth page-turner connection retry requested")
-    UIManager:scheduleIn(3, function() self:_status() end)
+    local name = result.address
+    for _, dev in ipairs(type(data.devices) == "table" and data.devices or {}) do
+        if dev.address == result.address and type(dev.name) == "string" then name = dev.name end
+    end
+    self:_show("Connecting " .. name .. "…", 4)
+    self:_monitorConnection(result.address, name, 0)
+end
+
+function BluetoothControl:_monitorConnection(address, name, tick)
+    self._connect_poll_cb = function()
+        self._connect_poll_cb = nil
+        local data, err = self:_status()
+        if not data then
+            self:_show("Connection check failed: " .. tostring(err), 5)
+            return
+        end
+        for _, conn in ipairs(type(data.connections) == "table" and data.connections or {}) do
+            if type(conn) == "table" and conn.address == address and conn.hid_ready ~= false then
+                self:_show(name .. " connected", 3)
+                return
+            end
+        end
+        if tick >= 12 then
+            self:_show(name .. " connection failed", 6)
+            return
+        end
+        self:_monitorConnection(address, name, tick + 1)
+    end
+    UIManager:scheduleIn(2, self._connect_poll_cb)
 end
 
 function BluetoothControl:chooseClassicDevice()
@@ -196,12 +223,13 @@ function BluetoothControl:chooseClassicDevice()
             buttons[#buttons + 1] = {{ text = name, callback = function()
                 UIManager:close(self._connect_dialog)
                 self._connect_dialog = nil
-                local body, err = self:_httpGet("/retry-classic?addr=" .. urlEncode(address))
-                if err or not body or not body:find('"ok"%s*:%s*true') then
+                local result, err = self:_json("/retry-classic?addr=" .. urlEncode(address))
+                if err or not result or result.ok ~= true then
                     self:_show("Targeted connection was not accepted", 5)
                     return
                 end
                 self:_show("Connecting " .. name .. "…", 4)
+                self:_monitorConnection(address, name, 0)
             end }}
         end
     end
@@ -422,8 +450,10 @@ end
 function BluetoothControl:onCloseWidget()
     if self._scan_poll_cb then UIManager:unschedule(self._scan_poll_cb) end
     if self._pair_poll_cb then UIManager:unschedule(self._pair_poll_cb) end
+    if self._connect_poll_cb then UIManager:unschedule(self._connect_poll_cb) end
     self._scan_poll_cb = nil
     self._pair_poll_cb = nil
+    self._connect_poll_cb = nil
     if self.ui.view and self.ui.view.footer and self._footer_content_func then
         self.ui.view.footer:removeAdditionalFooterContent(self._footer_content_func)
     end

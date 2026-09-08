@@ -200,15 +200,17 @@ class ClassicMixin:
         event = getattr(self, '_classic_retry_event', None)
         if event is None:
             return False
-        if address is not None:
-            target = normalize_addr(address)
-            allowed = {normalize_addr(d.address) for d in self.classic_devices
-                       if d.address != '*'}
-            if target not in allowed:
-                return False
-            self._classic_preferred_address = target
+        allowed = [normalize_addr(d.address) for d in self.classic_devices
+                   if d.address != '*']
+        target = normalize_addr(address) if address is not None else (
+            self._classic_preferred_address
+            or getattr(self, '_classic_active_address', None)
+            or (allowed[0] if allowed else None))
+        if target not in allowed:
+            return False
+        self._classic_preferred_address = target
         event.set()
-        return True
+        return target
 
     async def _classic_retry_sleep(self, delay):
         """Sleep until the next normal attempt, or consume a manual retry."""
@@ -319,6 +321,7 @@ class ClassicMixin:
                 log.info(f"[Classic] Attempt {attempt}: {self._format_device(addr)}")
 
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
+                self._classic_active_address = normalize_addr(addr)
                 await self._radio_lock.acquire()
                 connect_task = asyncio.create_task(
                     self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
@@ -379,6 +382,7 @@ class ClassicMixin:
                     except (asyncio.CancelledError, Exception):
                         pass
                     self._radio_lock.release()
+                    self._classic_active_address = None
 
                 if manual_retry:
                     break

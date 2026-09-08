@@ -248,9 +248,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         self._send_json({"ok": True, "message": f"Connecting to {address}"})
 
     def _handle_retry_classic(self, address=None):
-        if self._controller.request_retry_classic(address):
+        target = self._controller.request_retry_classic(address)
+        if target:
             self._send_json({"ok": True,
-                             "message": "Classic connection retry requested"})
+                             "message": "Classic connection retry requested",
+                             "address": target})
         else:
             self._send_json({"ok": False,
                              "error": "Classic retry loop is not active"})
