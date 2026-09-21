@@ -50,6 +50,7 @@ class DaemonController:
         self._devices_cache = None
         self._devices_mtime = 0
         self._devices_lock = threading.Lock()
+        self._classic_retry_delivery_task = None
 
         # Mouse cursor overlay process
         self._cursor_proc = None
@@ -235,15 +236,63 @@ class DaemonController:
             return False
 
     async def _do_retry_classic(self, address=None):
-        async with self._op_lock:
-            if self.daemon._suspended or not self.daemon.running:
-                return False
-            host = self.daemon.host
-            if host is None or not hasattr(host, 'retry_classic_connection'):
-                return False
-            if address is None:
-                return host.retry_classic_connection()
-            return host.retry_classic_connection(address)
+        # A Classic host is intentionally short-lived when the outer daemon
+        # reaches its no-device timeout.  A manual retry can arrive during the
+        # few seconds between hosts; rejecting it loses the Joy-Con's short
+        # wake window and lets the next host fall back to configuration order.
+        # Validate and queue the target instead.  This operation only signals
+        # an asyncio.Event on the loop thread, so it must not wait behind the
+        # long-running scan/pair/suspend operation lock.
+        if self.daemon._suspended or not self.daemon.running:
+            return False
+
+        host = self.daemon.host
+        if address is None and host is not None \
+                and hasattr(host, 'retry_classic_connection'):
+            accepted = host.retry_classic_connection()
+            if accepted:
+                return accepted
+
+        classic = [normalize_addr(addr) for addr, protocol, _ in
+                   config.get_all_devices()
+                   if protocol == Protocol.CLASSIC and addr != '*']
+        target = normalize_addr(address) if address is not None else (
+            classic[0] if classic else None)
+        if target not in classic:
+            return False
+
+        if host is not None and hasattr(host, 'retry_classic_connection'):
+            accepted = host.retry_classic_connection(target)
+            if accepted:
+                return accepted
+
+        old_task = self._classic_retry_delivery_task
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        self._classic_retry_delivery_task = asyncio.create_task(
+            self._deliver_classic_retry(target))
+        return target
+
+    async def _deliver_classic_retry(self, target):
+        """Deliver one accepted target across a transient host rebuild."""
+        try:
+            for _ in range(60):
+                if self.daemon._suspended or not self.daemon.running:
+                    return
+                host = self.daemon.host
+                if host is not None and hasattr(host, 'retry_classic_connection'):
+                    if host.retry_classic_connection(target):
+                        logger.info(
+                            f"Queued Classic retry delivered to {target}")
+                        return
+                await asyncio.sleep(0.25)
+            logger.warning(
+                f"Queued Classic retry expired before host was ready: {target}")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._classic_retry_delivery_task is asyncio.current_task():
+                self._classic_retry_delivery_task = None
 
     async def _do_connect(self, address, protocol):
         async with self._op_lock:

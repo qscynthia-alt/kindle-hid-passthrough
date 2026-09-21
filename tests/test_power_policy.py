@@ -118,6 +118,61 @@ def test_classic_retry_refuses_suspended_daemon():
     asyncio.run(run())
 
 
+def test_targeted_classic_retry_queues_across_host_rebuild():
+    class FakeHost:
+        def __init__(self):
+            self.calls = []
+
+        def retry_classic_connection(self, address):
+            self.calls.append(address)
+            return address
+
+    async def run():
+        daemon = FakeDaemon()
+        daemon.host = None
+        ctrl = DaemonController(daemon)
+        old_get_all = controller_mod.config.get_all_devices
+        controller_mod.config.get_all_devices = lambda: [
+            ('E0:F6:B5:D0:56:73', controller_mod.Protocol.CLASSIC, 'Joy-Con (L)')]
+        try:
+            result = await ctrl._do_retry_classic('E0:F6:B5:D0:56:73')
+            assert result == 'E0:F6:B5:D0:56:73'
+            host = FakeHost()
+            daemon.host = host
+            await asyncio.sleep(0.3)
+            assert host.calls == ['E0:F6:B5:D0:56:73']
+            assert ctrl._classic_retry_delivery_task is None
+        finally:
+            controller_mod.config.get_all_devices = old_get_all
+
+    asyncio.run(run())
+
+
+def test_targeted_classic_retry_does_not_wait_for_operation_lock():
+    class FakeHost:
+        def retry_classic_connection(self, address):
+            return address
+
+    async def run():
+        daemon = FakeDaemon()
+        daemon.host = FakeHost()
+        ctrl = DaemonController(daemon)
+        old_get_all = controller_mod.config.get_all_devices
+        controller_mod.config.get_all_devices = lambda: [
+            ('E0:F6:B5:D0:56:73', controller_mod.Protocol.CLASSIC, 'Joy-Con (L)')]
+        try:
+            await ctrl._op_lock.acquire()
+            result = await asyncio.wait_for(
+                ctrl._do_retry_classic('E0:F6:B5:D0:56:73'), timeout=0.1)
+            assert result == 'E0:F6:B5:D0:56:73'
+        finally:
+            if ctrl._op_lock.locked():
+                ctrl._op_lock.release()
+            controller_mod.config.get_all_devices = old_get_all
+
+    asyncio.run(run())
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith('test_')]
     failed = 0
