@@ -371,13 +371,17 @@ class HIDHost(ClassicMixin, BLEMixin):
             raise InvalidStateError(
                 f"{next(iter(done)).get_name()} exited unexpectedly")
         finally:
+            self._handler_tasks = tasks
             for task in tasks:
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
+            finished, pending = await asyncio.wait(tasks, timeout=5.0)
+            for task in finished:
+                if not task.cancelled():
+                    task.exception()  # Retrieve watchdog exceptions during cancellation.
+            if pending:
+                raise RuntimeError("Protocol handlers did not stop; transport release refused")
+            self._handler_tasks = []
 
     async def _session_watchdog(self):
         """Ask the daemon for a transport rebuild if nothing ever connects.
@@ -658,6 +662,8 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     async def cleanup(self):
         """Clean up resources."""
+        if any(not task.done() for task in getattr(self, '_handler_tasks', [])):
+            raise RuntimeError("Live protocol handler; refusing concurrent transport cleanup")
         if self._connection_tasks:
             pending = list(self._connection_tasks)
             for task in pending:
@@ -701,8 +707,9 @@ class HIDHost(ClassicMixin, BLEMixin):
                 await asyncio.wait_for(self.transport.close(), timeout=3.0)
             except asyncio.TimeoutError:
                 log.warning("Transport close timed out, fd may leak")
+                raise RuntimeError("Transport close timed out; ownership unknown")
             except Exception:
-                pass
+                raise
             self.transport = None
             from bt_setup import chip
             chip().on_transport_close()

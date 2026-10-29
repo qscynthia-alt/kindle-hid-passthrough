@@ -158,13 +158,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         controller = self._controller
         controller.bt_enabled = True
         controller.request_connect()
-        self._send_json({"ok": True, "message": "Bluetooth on"})
+        self._send_json({"ok": True, "message": "Start requested; verify worker_state and connection"})
 
     def _handle_stop(self):
         controller = self._controller
         controller.bt_enabled = False
         controller.request_disconnect(suspend=True)
-        self._send_json({"ok": True, "message": "Bluetooth off"})
+        self._send_json({"ok": True, "message": "Stop requested; verify transport_released before recovery"})
 
     def _handle_devices(self):
         status = self._controller.get_status()

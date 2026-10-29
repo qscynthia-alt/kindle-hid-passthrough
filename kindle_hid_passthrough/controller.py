@@ -61,7 +61,11 @@ class DaemonController:
         devices = self._get_devices_cached()
 
         status = {
-            "daemon_running": self.bt_enabled and self.daemon.running,
+            "daemon_running": self.daemon.running and not self.daemon.worker_fault and (not self.daemon._suspended or not self.daemon.transport_released),
+            "requested_enabled": self.bt_enabled,
+            "worker_fault": self.daemon.worker_fault,
+            "transport_released": self.daemon.transport_released,
+            "worker_state": ("faulted" if self.daemon.worker_fault else "parked" if self.daemon._suspended and self.daemon.transport_released else "stopping" if self.daemon._suspended else "running"),
             "capabilities": ["retry_classic"],
             "devices": devices,
             "device_count": len(devices),
@@ -92,6 +96,9 @@ class DaemonController:
         return await host.make_discoverable(duration)
 
     async def _resume_if_enabled(self):
+        if self.daemon.worker_fault:
+            logger.error("HID worker fault; manual process recovery required: %s", self.daemon.worker_fault)
+            return
         """Resume unless BT was toggled off while the op ran."""
         if self.bt_enabled:
             await self.daemon.resume()
@@ -297,6 +304,16 @@ class DaemonController:
     async def _do_connect(self, address, protocol):
         async with self._op_lock:
             try:
+                if self.daemon.worker_fault:
+                    raise RuntimeError(self.daemon.worker_fault)
+                if protocol == Protocol.BLE and any(
+                    normalize_addr(saved) == normalize_addr(address) and proto == Protocol.BLE
+                    for saved, proto, _ in config.get_all_devices()
+                ):
+                    # The current accept-list handler already serves this peer.
+                    # Repeated Connect must not cancel the running host.
+                    await self._resume_if_enabled()
+                    return
                 await self.daemon.suspend()
                 config.add_device(address, protocol)
                 await self._resume_if_enabled()

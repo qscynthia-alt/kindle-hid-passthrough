@@ -33,6 +33,9 @@ class HIDDaemon:
         self.host = None
         self._host_task = None
         self._suspended = False
+        self.transport_released = True
+        self.worker_fault = None
+        self._fault_stop = asyncio.Event()
         self._resume_event = asyncio.Event()
         self._paired_host = None
         # Set in main(): called with True/False as a pointer device connects/leaves.
@@ -47,6 +50,8 @@ class HIDDaemon:
 
     async def suspend(self):
         """Disconnect and release transport for scan/pair."""
+        if self.worker_fault:
+            raise RuntimeError(self.worker_fault)
         logger.info("Daemon suspending...")
         self._suspended = True
         self._resume_event.clear()
@@ -54,15 +59,20 @@ class HIDDaemon:
         # Cancel the host task first — this stops host.run()'s connect loop
         if self._host_task and not self._host_task.done():
             self._host_task.cancel()
-            await self._abandon_after_timeout(self._host_task, "host task")
+            if not await self._abandon_after_timeout(self._host_task, "host task"):
+                self.worker_fault = "Host task did not stop; Bluetooth operations blocked"
+                raise RuntimeError(self.worker_fault)
             self._host_task = None
 
         # Then clean up any remaining resources
         if self.host:
-            await self._abandon_after_timeout(
-                asyncio.ensure_future(self.host.cleanup()), "host cleanup")
+            self._cleanup_task = asyncio.ensure_future(self.host.cleanup())
+            if not await self._abandon_after_timeout(self._cleanup_task, "host cleanup"):
+                self.worker_fault = "Host cleanup did not stop; Bluetooth operations blocked"
+                raise RuntimeError(self.worker_fault)
             self.host = None
 
+        self.transport_released = True
         logger.info("Daemon suspended")
 
     @staticmethod
@@ -75,11 +85,14 @@ class HIDDaemon:
         done, _ = await asyncio.wait({task}, timeout=SUSPEND_TIMEOUT)
         if not done:
             logger.warning(f"Suspend: {what} did not finish, abandoning it")
-            return
+            return False
         try:
             task.result()
-        except (asyncio.CancelledError, Exception):
-            pass
+        except asyncio.CancelledError:
+            return True
+        except Exception:
+            return False
+        return True
 
     async def scan(self, duration=10.0, on_device_found=None):
         """Scan for BT devices. Must be called while suspended."""
@@ -116,6 +129,8 @@ class HIDDaemon:
 
     async def resume(self):
         """Resume connections after scan/pair."""
+        if self.worker_fault:
+            raise RuntimeError(self.worker_fault)
         logger.info("Daemon resuming...")
         self._suspended = False
         self._resume_event.set()
@@ -146,6 +161,9 @@ class HIDDaemon:
         logger.info(f"HID Daemon v{get_version()}")
 
         while self.running:
+            if self.worker_fault:
+                await self._fault_stop.wait()
+                break
             # Wait for devices if none configured or after suspend
             if self._suspended:
                 logger.info("Daemon suspended, waiting for resume...")
@@ -164,12 +182,15 @@ class HIDDaemon:
                     break
                 continue
 
+            if self.worker_fault or not self.running:
+                continue
             chip().ensure_powered()
 
             try:
                 # Use handed-off host from controller pairing if available
                 if self._paired_host:
                     logger.info("=== Continuing with paired device ===")
+                    self.transport_released = False
                     self.host = self._paired_host
                     self._paired_host = None
                     self.host.on_pointer_change = self.on_pointer_change
@@ -178,6 +199,7 @@ class HIDDaemon:
                     )
                 else:
                     logger.info("=== Starting connection ===")
+                    self.transport_released = False
                     self.host = HIDHost()
                     self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
@@ -202,12 +224,15 @@ class HIDDaemon:
                 # When suspended, suspend() owns cleanup of self.host. Skipping
                 # here avoids a race where both paths run host.cleanup() in
                 # parallel and deadlock on transport/connection teardown.
-                if self.host and not self._suspended:
+                if self.host and not self._suspended and not self.worker_fault:
                     try:
                         await self.host.cleanup()
-                    except Exception:
-                        pass
-                    self.host = None
+                    except Exception as exc:
+                        self.worker_fault = "Transport cleanup unverified: " + str(exc)
+                        self._suspended = True
+                    else:
+                        self.host = None
+                        self.transport_released = True
 
             if not self.running:
                 break
@@ -233,9 +258,10 @@ class HIDDaemon:
         """Stop the daemon."""
         logger.info("Stopping...")
         self.running = False
+        self._fault_stop.set()
         # Wake up if suspended (waiting on _resume_event)
         self._resume_event.set()
-        if self.host:
+        if self.host and not self.worker_fault:
             try:
                 await self.host.cleanup()
             except Exception:

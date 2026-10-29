@@ -29,6 +29,9 @@ RUN pip install --no-cache-dir \
     ordered-set \
     bumble==0.0.226
 
+COPY .github/patch_bumble_health.py /build/patch_bumble_health.py
+RUN python /build/patch_bumble_health.py
+
 COPY .github/nuitka-plugins/ /build/nuitka-plugins/
 
 # Enable ccache and Nuitka's own caching
