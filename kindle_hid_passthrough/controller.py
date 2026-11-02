@@ -76,6 +76,8 @@ class DaemonController:
 
         conn = self.daemon.connection_state
         status["connections"] = conn.get("connections", [])
+        host = self.daemon.host
+        status["ble_diagnostics"] = host.ble_diagnostics() if host is not None and hasattr(host, 'ble_diagnostics') else None
 
         return status
 

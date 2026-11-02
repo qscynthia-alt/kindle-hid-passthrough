@@ -43,8 +43,33 @@ class BLEMixin:
     BLE_INIT_WINDOW = 18.0
     BLE_SCAN_WINDOW = 8.0
 
+    def _mark_ble(self, stage):
+        # Replaced atomically; read-only status never walks /proc or task locals.
+        self._ble_progress = {"stage": stage, "at": time.monotonic()}
+
+    def ble_diagnostics(self):
+        progress = dict(getattr(self, '_ble_progress', {}))
+        stamp = progress.pop('at', None)
+        progress['age_seconds'] = round(max(0.0, time.monotonic() - stamp), 1) if stamp is not None else None
+        task = getattr(self, '_ble_handler_task', None)
+        progress['task_done'] = task.done() if task is not None else None
+        progress['task_cancelled'] = task.cancelled() if task is not None else None
+        chain = []
+        current = task.get_coro() if task is not None else None
+        for _ in range(8):
+            if current is None:
+                break
+            frame = getattr(current, 'cr_frame', None) or getattr(current, 'gi_frame', None)
+            if frame is not None:
+                chain.append({"function": frame.f_code.co_name[:80], "line": frame.f_lineno})
+            current = getattr(current, 'cr_await', None) or getattr(current, 'gi_yieldfrom', None)
+        progress['await_chain'] = chain
+        return progress
+
     async def _run_ble_handler(self):
         """Handle BLE connections."""
+        self._ble_handler_task = asyncio.current_task()
+        self._mark_ble('handler_started')
         has_known = any(dev.address != '*' for dev in self.ble_devices)
         has_wildcard = any(dev.address == '*' for dev in self.ble_devices)
 
@@ -87,11 +112,14 @@ class BLEMixin:
 
         while True:
             try:
+                self._mark_ble('checking_saved_devices')
                 missing = self._ble_missing_addresses()
                 if not missing:
+                    self._mark_ble('all_saved_devices_connected')
                     await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
                     continue
 
+                self._mark_ble('seeding_accept_list')
                 known = await self._seed_accept_list(missing)
 
                 matched_dev = None
@@ -108,6 +136,7 @@ class BLEMixin:
                 if connection is None:
                     continue
 
+                self._mark_ble('admitting_connection')
                 self._admit_ble_connection(connection, matched_dev, match_kind)
 
             except asyncio.CancelledError:
@@ -223,6 +252,7 @@ class BLEMixin:
                 future.exception()
         pending.add_done_callback(consume_exception)
 
+        self._mark_ble('waiting_radio_lock')
         await self._radio_lock.acquire()
         self.device.on(Device.EVENT_CONNECTION, on_connection)
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
@@ -231,6 +261,7 @@ class BLEMixin:
             self.device.connect_own_address_type = OwnAddressType.PUBLIC
             self.device.le_connecting = True
 
+            self._mark_ble('sending_create_connection')
             await self.device.send_command(
                 HCI_LE_Create_Connection_Command(
                     le_scan_interval=96,
@@ -247,23 +278,35 @@ class BLEMixin:
                     max_ce_length=0,
                 ), check_result=True)
 
+            result = None
             try:
-                return await asyncio.wait_for(asyncio.shield(pending), timeout=window)
+                self._mark_ble('waiting_connection_event')
+                result = await asyncio.wait_for(asyncio.shield(pending), timeout=window)
             except asyncio.TimeoutError:
-                return None
+                pass
 
         finally:
-            if not pending.done():
-                try:
-                    await self.device.send_command(
-                        HCI_LE_Create_Connection_Cancel_Command())
-                    await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
-                except Exception:
-                    pass
-            self.device.le_connecting = False
-            self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
-            self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
-            self._radio_lock.release()
+            try:
+                if not pending.done():
+                    try:
+                        self._mark_ble('cancelling_create_connection')
+                        await self.device.send_command(
+                            HCI_LE_Create_Connection_Cancel_Command())
+                        self._mark_ble('waiting_cancel_event')
+                        await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
+                    except Exception:
+                        pass
+                # The connection can win the race against create-connection
+                # cancellation. Return that link to the caller for admission;
+                # returning None before finally silently orphaned the link.
+                if pending.done() and not pending.cancelled() and pending.exception() is None:
+                    result = pending.result()
+            finally:
+                self.device.le_connecting = False
+                self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
+                self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
+                self._radio_lock.release()
+        return result
 
     async def _ble_scan_for_rotated(self, known: set, window: float):
         """Scan for bonded devices advertising, including from a rotated
@@ -277,10 +320,12 @@ class BLEMixin:
             if match:
                 rotated.set_result((advertisement.address,) + match)
 
+        self._mark_ble('waiting_radio_lock')
         await self._radio_lock.acquire()
         self.device.on('advertisement', on_advertisement)
         scanning = False
         try:
+            self._mark_ble('rotation_scan')
             await self.device.start_scanning(
                 legacy=True,
                 own_address_type=OwnAddressType.PUBLIC,
