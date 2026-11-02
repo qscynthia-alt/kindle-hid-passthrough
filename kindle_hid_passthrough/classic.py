@@ -2,6 +2,7 @@
 """Classic Bluetooth HID handler mixin for HIDHost."""
 
 import asyncio
+import time
 
 from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, InvalidStateError
 from bumble.core import TimeoutError as BumbleTimeoutError
@@ -306,6 +307,9 @@ class ClassicMixin:
 
         attempt = 0
         while True:
+            # Finite user-request priority; never start another HCI owner.
+            while time.monotonic() < getattr(self, '_ble_manual_priority_until', 0.0):
+                await asyncio.sleep(0.1)
             attempt += 1
             manual_retry = False
             addresses = [d.address for d in self.classic_devices if d.address != '*'
@@ -327,6 +331,10 @@ class ClassicMixin:
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
                 self._classic_active_address = normalize_addr(addr)
                 await self._radio_lock.acquire()
+                if time.monotonic() < getattr(self, '_ble_manual_priority_until', 0.0):
+                    self._radio_lock.release()
+                    manual_retry = True
+                    break
                 connect_task = asyncio.create_task(
                     self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
                 )

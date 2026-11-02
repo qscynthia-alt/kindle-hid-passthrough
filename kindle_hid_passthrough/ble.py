@@ -64,6 +64,7 @@ class BLEMixin:
                 chain.append({"function": frame.f_code.co_name[:80], "line": frame.f_lineno})
             current = getattr(current, 'cr_await', None) or getattr(current, 'gi_yieldfrom', None)
         progress['await_chain'] = chain
+        progress['recent_link_events'] = list(getattr(self, '_ble_link_events', []))
         return progress
 
     async def _run_ble_handler(self):
@@ -87,6 +88,10 @@ class BLEMixin:
         if task is None or task.done():
             return False
         self._ble_preferred_address = address
+        self._ble_manual_priority_until = time.monotonic() + 45.0
+        classic = getattr(self, '_classic_retry_event', None)
+        if classic is not None:
+            classic.set()
         event = getattr(self, '_ble_retry_event', None)
         if event is not None:
             event.set()
@@ -127,6 +132,7 @@ class BLEMixin:
         log.info("[BLE] Accept-list handler running")
 
         while True:
+            manual = False
             try:
                 self._mark_ble('checking_saved_devices')
                 missing = self._ble_missing_addresses()
@@ -147,6 +153,8 @@ class BLEMixin:
                 preferred = getattr(self, '_ble_preferred_address', None)
                 self._ble_preferred_address = None
                 if preferred in missing:
+                    manual = True
+                    self._mark_ble('manual_target_attempt')
                     known_type = self._keystore_address_types.get(preferred)
                     if known_type is not None:
                         connection = await self._ble_initiate(
@@ -155,6 +163,11 @@ class BLEMixin:
                         connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
                 else:
                     connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
+
+                if connection is None and getattr(self, '_ble_preferred_address', None) in missing:
+                    # A user request arrived during the old bounded attempt.
+                    # Consume it before another scan or background page.
+                    continue
 
                 if connection is None:
                     match = await self._ble_scan_for_rotated(known, self.BLE_SCAN_WINDOW)
@@ -174,6 +187,32 @@ class BLEMixin:
             except Exception as e:
                 log.warning(f"[BLE] Connection failed: {e}")
                 await asyncio.sleep(2.0)
+            finally:
+                if manual and getattr(self, '_ble_preferred_address', None) is None:
+                    self._ble_manual_priority_until = 0.0
+
+    def _observe_ble_link(self, connection):
+        # Fixed-size metadata only: no HID payload, keys, process scan or timer.
+        def record(event, error=None):
+            params = getattr(connection, 'parameters', None)
+            item = {'event': event, 'at': round(time.monotonic(), 3),
+                    'address': normalize_addr(str(connection.peer_address)),
+                    'encrypted': bool(connection.is_encrypted),
+                    'reports': getattr(connection, '_hid_report_count', 0)}
+            if error is not None:
+                item['code'] = int(error)
+            if params is not None:
+                for name in ('connection_interval', 'peripheral_latency', 'supervision_timeout'):
+                    value = getattr(params, name, None)
+                    if isinstance(value, (int, float)):
+                        item[name] = value
+            self._ble_link_events = (getattr(self, '_ble_link_events', []) + [item])[-16:]
+        connection.on('connection_encryption_change', lambda: record('encryption_changed'))
+        connection.on('connection_encryption_failure', lambda code: record('encryption_failed', code))
+        connection.on('connection_parameters_update', lambda: record('parameters_changed'))
+        connection.on('connection_parameters_update_failure', lambda code: record('parameters_failed', code))
+        connection.on('disconnection', lambda code: record('disconnected', code))
+        record('connected')
 
     def _admit_ble_connection(self, connection, matched_dev=None, match_kind=None):
         """Create a session for a new BLE connection, dropping duplicates."""
@@ -197,6 +236,7 @@ class BLEMixin:
             return
 
         log.info(f"[BLE] Device connected: {self._format_device(addr)}")
+        self._observe_ble_link(connection)
         session = self._new_session(addr, Protocol.BLE, connection)
         session.peer = Peer(connection)
         self._register_session(session)
@@ -613,6 +653,8 @@ class BLEMixin:
 
     def _on_ble_hid_report(self, session, value, report_id):
         """Handle BLE HID report."""
+        if session.connection is not None:
+            session.connection._hid_report_count = getattr(session.connection, '_hid_report_count', 0) + 1
         prefix = bytes([report_id]) if report_id else b''
         self._forward_report(session, prefix + bytes(value))
 
