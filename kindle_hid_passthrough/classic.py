@@ -165,6 +165,9 @@ class ClassicMixin:
                 return
 
             addr_str = str(connection.peer_address)
+            if getattr(self, 'connection_policy', {}).get((normalize_addr(addr_str), 'classic')) == 'disconnect':
+                self._track_task(asyncio.create_task(self._reject_connection(connection)))
+                return
             if not self._is_classic_allowed(addr_str):
                 if self.media_remote:
                     self.media_remote.adopt(connection)
@@ -305,7 +308,8 @@ class ClassicMixin:
         while True:
             attempt += 1
             manual_retry = False
-            addresses = [d.address for d in self.classic_devices if d.address != '*']
+            addresses = [d.address for d in self.classic_devices if d.address != '*'
+                         and getattr(self, 'connection_policy', {}).get((normalize_addr(d.address), 'classic')) != 'disconnect']
             preferred = getattr(self, '_classic_preferred_address', None)
             if preferred:
                 addresses.sort(key=lambda addr: normalize_addr(addr) != preferred)

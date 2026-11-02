@@ -78,10 +78,25 @@ class BLEMixin:
         elif has_wildcard:
             await self._run_ble_scan_handler(set())
 
+    def retry_ble_connection(self, address):
+        """Queue one targeted pass on the existing BLE owner, never reset it."""
+        address = normalize_addr(address)
+        if address not in {normalize_addr(d.address) for d in self.ble_devices}:
+            return False
+        task = getattr(self, '_ble_handler_task', None)
+        if task is None or task.done():
+            return False
+        self._ble_preferred_address = address
+        event = getattr(self, '_ble_retry_event', None)
+        if event is not None:
+            event.set()
+        return True
+
     def _ble_missing_addresses(self):
         """Configured BLE addresses without a live session."""
         return [normalize_addr(d.address) for d in self.ble_devices
-                if d.address != '*' and normalize_addr(d.address) not in self.sessions]
+                if d.address != '*' and normalize_addr(d.address) not in self.sessions
+                and getattr(self, 'connection_policy', {}).get((normalize_addr(d.address), 'ble')) != 'disconnect']
 
     async def _seed_accept_list(self, missing):
         """Load the filter accept list with every address we may connect to."""
@@ -89,7 +104,7 @@ class BLEMixin:
             HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
 
         known = set(missing) | {a for a in self._keystore_addresses
-                                if a not in self.sessions}
+                                if a not in self.sessions and getattr(self, 'connection_policy', {}).get((a, 'ble')) != 'disconnect'}
 
         for addr_str in sorted(known):
             target = Address(addr_str)
@@ -108,6 +123,7 @@ class BLEMixin:
 
     async def _run_ble_accept_list_handler(self):
         """Connect to configured BLE devices using the filter accept list."""
+        self._ble_retry_event = asyncio.Event()
         log.info("[BLE] Accept-list handler running")
 
         while True:
@@ -116,7 +132,11 @@ class BLEMixin:
                 missing = self._ble_missing_addresses()
                 if not missing:
                     self._mark_ble('all_saved_devices_connected')
-                    await asyncio.sleep(self.ACTIVE_RETRY_INTERVAL)
+                    try:
+                        await asyncio.wait_for(self._ble_retry_event.wait(), self.ACTIVE_RETRY_INTERVAL)
+                    except asyncio.TimeoutError:
+                        pass
+                    self._ble_retry_event.clear()
                     continue
 
                 self._mark_ble('seeding_accept_list')
@@ -124,7 +144,17 @@ class BLEMixin:
 
                 matched_dev = None
                 match_kind = None
-                connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
+                preferred = getattr(self, '_ble_preferred_address', None)
+                self._ble_preferred_address = None
+                if preferred in missing:
+                    known_type = self._keystore_address_types.get(preferred)
+                    if known_type is not None:
+                        connection = await self._ble_initiate(
+                            self.BLE_INIT_WINDOW, peer=Address(preferred, known_type & 1))
+                    else:
+                        connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
+                else:
+                    connection = await self._ble_initiate(self.BLE_INIT_WINDOW)
 
                 if connection is None:
                     match = await self._ble_scan_for_rotated(known, self.BLE_SCAN_WINDOW)
@@ -157,6 +187,9 @@ class BLEMixin:
             self._track_task(asyncio.create_task(self._reject_connection(connection)))
             return
 
+        if getattr(self, 'connection_policy', {}).get((addr, 'ble')) == 'disconnect':
+            self._track_task(asyncio.create_task(self._reject_connection(connection)))
+            return
         old = self.sessions.get(addr)
         if old is not None and old.is_alive():
             log.info(f"[BLE] Duplicate connection from {addr}, dropping")

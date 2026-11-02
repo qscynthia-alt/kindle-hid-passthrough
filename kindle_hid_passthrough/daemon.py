@@ -30,6 +30,7 @@ class HIDDaemon:
 
     def __init__(self):
         self.running = False
+        self.connection_policy = {}
         self.host = None
         self._host_task = None
         self._suspended = False
@@ -193,6 +194,7 @@ class HIDDaemon:
                     self.transport_released = False
                     self.host = self._paired_host
                     self._paired_host = None
+                    self.host.connection_policy = self.connection_policy
                     self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.continue_after_pairing()
@@ -201,6 +203,7 @@ class HIDDaemon:
                     logger.info("=== Starting connection ===")
                     self.transport_released = False
                     self.host = HIDHost()
+                    self.host.connection_policy = self.connection_policy
                     self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.run()
@@ -258,6 +261,7 @@ class HIDDaemon:
         """Stop the daemon."""
         logger.info("Stopping...")
         self.running = False
+        self.connection_policy = {}
         self._fault_stop.set()
         # Wake up if suspended (waiting on _resume_event)
         self._resume_event.set()

@@ -15,6 +15,7 @@ import threading
 from bt_setup import chip
 from config import Protocol, config, normalize_addr
 from device_cache import DeviceCache
+from connection_state import ConnectionStateMachine
 from logging_utils import errstr
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,9 @@ class DaemonController:
 
     def __init__(self, daemon):
         self.daemon = daemon
+        self.connections = ConnectionStateMachine()
+        self._connection_teardowns = {}
+        self._connection_unconfirmed = {}
         self.loop = None  # Set when event loop starts
 
         self._op_lock = asyncio.Lock()
@@ -66,7 +70,7 @@ class DaemonController:
             "worker_fault": self.daemon.worker_fault,
             "transport_released": self.daemon.transport_released,
             "worker_state": ("faulted" if self.daemon.worker_fault else "parked" if self.daemon._suspended and self.daemon.transport_released else "stopping" if self.daemon._suspended else "running"),
-            "capabilities": ["retry_classic"],
+            "capabilities": ["retry_classic", "connection_fsm_v2"],
             "devices": devices,
             "device_count": len(devices),
             "scanning": self.is_scanning,
@@ -79,7 +83,93 @@ class DaemonController:
         host = self.daemon.host
         status["ble_diagnostics"] = host.ble_diagnostics() if host is not None and hasattr(host, 'ble_diagnostics') else None
 
+        for target, connection in list(self._connection_unconfirmed.items()):
+            if getattr(connection, 'is_disconnected', False):
+                self._connection_unconfirmed.pop(target, None)
+        pending = set(self._connection_unconfirmed)
+        pending.update(target for target, task in list(self._connection_teardowns.items()) if not task.done())
+        status["device_teardowns"] = [{"address": a, "protocol": p,
+            "state": 'disconnect_unconfirmed' if (a, p) in self._connection_unconfirmed else 'disconnecting'}
+            for a, p in sorted(pending)]
+        status["connection_fsm"] = self.connections.snapshot(status)
         return status
+
+    def request_connection_operation(self, action, address, protocol, request_id):
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_connection_operation(action, address, protocol, request_id), self.loop)
+        try:
+            return {"ok": True, "operation": future.result(timeout=2.0)}
+        except TimeoutError:
+            return {"ok": True, "receipt_pending": True, "request_id": request_id}
+        except Exception as error:
+            return {"ok": False, "error": str(error)[:160], "request_id": request_id}
+
+    async def _do_connection_operation(self, action, address, protocol, request_id):
+        status = self.get_status()
+        def dispatch(command, target, proto):
+            host = self.daemon.host
+            if host is None:
+                raise ValueError('Connection host is not ready')
+            if command == 'connect':
+                if proto == 'ble':
+                    accepted = host.retry_ble_connection(target)
+                else:
+                    accepted = bool(host.retry_classic_connection(target))
+                if not accepted:
+                    raise ValueError('Protocol handler is not ready')
+                self.daemon.connection_policy[(target, proto)] = 'connect'
+                return True
+            self.daemon.connection_policy[(target, proto)] = 'disconnect'
+            task = asyncio.create_task(self._finish_connection_disconnect(host, target, proto))
+            self._connection_teardowns[(target, proto)] = task
+            # Existing host tracks/joins connection-related work on teardown.
+            host._track_task(task)
+            return True
+        operation = self.connections.submit(action, address, protocol, request_id, status, dispatch)
+        if operation['action'] == 'connect' and operation['reason'] in ('already_ready', 'configuring_hid'):
+            self.daemon.connection_policy[(operation['address'], operation['protocol'])] = 'connect'
+        return operation
+
+    async def _finish_connection_disconnect(self, host, address, protocol):
+        key = (address, protocol)
+        session = host.sessions.get(address)
+        connection = session.connection if session is not None else None
+        observed = asyncio.Event()
+        def disconnected(*_):
+            observed.set()
+        if connection is not None:
+            connection.on('disconnection', disconnected)
+        teardown = asyncio.create_task(host.end_session(address))
+        host._track_task(teardown)
+        parent = asyncio.current_task()
+        def consume(task):
+            if not task.cancelled():
+                task.exception()
+            if self._connection_teardowns.get(key) is task:
+                self._connection_teardowns.pop(key, None)
+        teardown.add_done_callback(consume)
+        try:
+            done, _ = await asyncio.wait({teardown}, timeout=getattr(self, '_teardown_timeout', 5.0))
+            if not done:
+                raise TimeoutError('Session cleanup still active')
+            teardown.result()
+            if connection is not None and not getattr(connection, 'is_disconnected', False) and not observed.is_set():
+                await asyncio.wait_for(observed.wait(), timeout=getattr(self, '_disconnect_event_timeout', 3.0))
+        except asyncio.CancelledError:
+            self.connections.fail('disconnect', address, protocol, 'service_interrupted')
+            raise
+        except Exception:
+            if connection is not None:
+                self._connection_unconfirmed[key] = connection
+            self.connections.fail('disconnect', address, protocol, 'disconnect_not_confirmed')
+        finally:
+            if connection is not None:
+                connection.remove_listener('disconnection', disconnected)
+            if self._connection_teardowns.get(key) is parent:
+                if teardown.done():
+                    self._connection_teardowns.pop(key, None)
+                else:
+                    self._connection_teardowns[key] = teardown
 
     def request_discoverable(self, duration: float) -> bool:
         """From HTTP thread: open a phone-pairing window on the host."""

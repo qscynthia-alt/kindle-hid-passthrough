@@ -26,6 +26,7 @@ paging loop without suspending HIDHost or closing the Bluetooth transport.
 """
 
 import json
+from uuid import uuid4
 import os
 import socket
 import subprocess
@@ -107,6 +108,13 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._handle_pair(param('addr'), param('protocol'), param('name'))
             case '/pair-status':
                 self._handle_pair_status()
+            case '/connection-request':
+                controller = self.server.controller
+                if controller:
+                    self._send_json(controller.request_connection_operation(
+                        param('action'), param('addr'), param('protocol'), param('request_id')))
+                else:
+                    self._send_json({"ok": False, "error": "Daemon unavailable"})
             case '/connect':
                 self._handle_connect(param('addr'), param('protocol'))
             case '/retry-classic':
@@ -244,8 +252,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "No address provided"})
             return
 
-        controller.request_connect(address, protocol_str or 'ble')
-        self._send_json({"ok": True, "message": f"Connecting to {address}"})
+        self._send_json(controller.request_connection_operation(
+            'connect', address, protocol_str or 'ble', 'legacy-' + uuid4().hex))
 
     def _handle_retry_classic(self, address=None):
         target = self._controller.request_retry_classic(address)
@@ -259,8 +267,13 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _handle_disconnect(self, address=None):
         controller = self._controller
-        controller.request_disconnect(address=address)
-        self._send_json({"ok": True, "message": "Disconnecting"})
+        device = next((d for d in controller._get_devices_cached()
+                       if d['address'].upper() == (address or '').upper()), None)
+        if device is None:
+            self._send_json({"ok": False, "error": "Select a saved device to disconnect"})
+            return
+        self._send_json(controller.request_connection_operation(
+            'disconnect', address, device['protocol'], 'legacy-' + uuid4().hex))
 
     def _handle_discoverable(self, duration_str):
         duration = 60
