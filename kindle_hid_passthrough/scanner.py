@@ -2,12 +2,25 @@
 """Bluetooth scanner — discovers HID devices on BLE + Classic concurrently."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
+from types import SimpleNamespace
+from radio_attempt import RadioAttempt, RadioScan
 
 from bumble.core import AdvertisingData, DeviceClass
 from bumble.gatt import GATT_HUMAN_INTERFACE_DEVICE_SERVICE
-from bumble.hci import Address
+from bumble.hci import (Address, HCI_Error, HCI_Remote_Name_Request_Command,
+                        HCI_Inquiry_Cancel_Command, HCI_SyncCommand,
+                        HCI_StatusAndAddressReturnParameters, metadata)
+
+
+@HCI_SyncCommand.sync_command(HCI_StatusAndAddressReturnParameters)
+@dataclass
+class HCI_Remote_Name_Request_Cancel_Command(
+        HCI_SyncCommand[HCI_StatusAndAddressReturnParameters]):
+    """Bluetooth Core 7.1.20; command missing from Bumble 0.0.226."""
+
+    bd_addr: Address = field(metadata=metadata(Address.parse_address))
 
 from config import Protocol, config, clean_device_name
 from logging_utils import log
@@ -46,6 +59,7 @@ class Scanner:
         self.transport = None
         self.device = None
         self.on_device_found = None  # Optional callback(DiscoveredDevice)
+        self._radio_attempts = set()
 
     async def start(self):
         """Initialize the Bumble device."""
@@ -53,15 +67,64 @@ class Scanner:
 
     async def cleanup(self):
         """Clean up resources."""
+        owners = [o.task for o in self._radio_attempts]
+        if owners:
+            await asyncio.wait(owners)
+        if self._radio_attempts:
+            raise RuntimeError('Scan hardware state unresolved; transport close refused')
+        hci_host = getattr(self.device, 'host', None)
+        commands = list(getattr(hci_host, '_command_transactions', ()))
+        if commands:
+            await asyncio.wait(commands)
+        if getattr(hci_host, '_command_fault', None):
+            raise RuntimeError('Scan command response unconfirmed; transport close refused')
         if self.transport:
-            try:
-                await self.transport.close()
-            except Exception:
-                pass
+            await self.transport.close()
             self.transport = None
             from bt_setup import chip
             chip().on_transport_close()
         self.device = None
+
+    async def _scan_window(self, event, listener, start, stop, duration, stop_event, detach_extra=None):
+        # BLE scan and Classic inquiry may coexist; each retains its own stop
+        # ACK, while cleanup waits for both before releasing the one transport.
+        lease_host = SimpleNamespace(_radio_attempts=self._radio_attempts,
+                                     _radio_lock=asyncio.Lock())
+        await lease_host._radio_lock.acquire()
+        pending = asyncio.get_running_loop().create_future()
+        self.device.on(event, listener)
+        def detach():
+            self.device.remove_listener(event, listener)
+            if detach_extra is not None:
+                detach_extra()
+        owner = RadioScan(lease_host, pending, start, stop,
+                          detach)
+        await owner.wait(duration, stop_event, caller_timeout=duration + 5.0)
+
+    async def _remote_name(self, address):
+        pending = asyncio.get_running_loop().create_future()
+        target = Address(address)
+        def success(peer, name):
+            if peer == target and not pending.done():
+                pending.set_result(name)
+        def failure(peer, code):
+            if peer == target and not pending.done():
+                pending.set_exception(HCI_Error(code))
+        self.device.on('remote_name', success)
+        self.device.on('remote_name_failure', failure)
+        def detach():
+            self.device.remove_listener('remote_name', success)
+            self.device.remove_listener('remote_name_failure', failure)
+        lease_host = SimpleNamespace(_radio_attempts=self._radio_attempts,
+                                     _radio_lock=asyncio.Lock())
+        await lease_host._radio_lock.acquire()
+        owner = RadioAttempt(lease_host, pending,
+            lambda: self.device.host.send_async_command(HCI_Remote_Name_Request_Command(
+                bd_addr=target, page_scan_repetition_mode=HCI_Remote_Name_Request_Command.R2,
+                reserved=0, clock_offset=0)),
+            lambda: self.device.host.send_sync_command(HCI_Remote_Name_Request_Cancel_Command(bd_addr=target)),
+            detach, rejection_errors=(HCI_Error,))
+        return await owner.wait(3.0, caller_timeout=8.0)
 
     async def scan(
         self,
@@ -83,6 +146,8 @@ class Scanner:
             try:
                 return await self._scan_concurrent(duration, stop_event)
             except Exception as e:
+                if self._radio_attempts:
+                    raise
                 log.warning(f"Concurrent scan failed ({e}), falling back to sequential")
                 return await self._scan_sequential(duration, stop_event)
         else:
@@ -190,13 +255,9 @@ class Scanner:
             if self.on_device_found:
                 self.on_device_found(device)
 
-        self.device.on('advertisement', on_advertisement)
-        try:
-            await self.device.start_scanning(filter_duplicates=True)
-            await self._interruptible_sleep(duration, stop_event)
-            await self.device.stop_scanning()
-        finally:
-            self.device.remove_listener('advertisement', on_advertisement)
+        await self._scan_window('advertisement', on_advertisement,
+                               lambda: self.device.start_scanning(filter_duplicates=True),
+                               self.device.stop_scanning, duration, stop_event)
 
         return devices_found
 
@@ -252,24 +313,33 @@ class Scanner:
                 if self.on_device_found:
                     self.on_device_found(device)
 
-        self.device.on('inquiry_result', on_inquiry_result)
-        try:
-            await self.device.start_discovery()
-            log.debug("Classic inquiry started")
-            await self._interruptible_sleep(duration, stop_event)
-            await self.device.stop_discovery()
-            log.info(f"Classic inquiry complete: {len(seen_addresses)} total, {len(devices_found)} HID")
-        finally:
-            self.device.remove_listener('inquiry_result', on_inquiry_result)
+        completed = asyncio.Event()
+        def on_complete():
+            completed.set()
+        self.device.on('inquiry_complete', on_complete)
+        async def start():
+            self.device.auto_restart_inquiry = False
+            await self.device.start_discovery(auto_restart=False)
+        async def stop():
+            self.device.auto_restart_inquiry = False
+            if not completed.is_set():
+                try:
+                    # Do not rely on Device.discovering: a partial start can
+                    # leave it false even after Inquiry reached the controller.
+                    await self.device.host.send_sync_command(HCI_Inquiry_Cancel_Command())
+                except HCI_Error:
+                    await completed.wait()
+            self.device.auto_restart_inquiry = False
+            self.device.discovering = False
+        await self._scan_window('inquiry_result', on_inquiry_result,
+                               start, stop, duration, stop_event,
+                               detach_extra=lambda: self.device.remove_listener('inquiry_complete', on_complete))
 
         # Get names for unknown devices
         for dev in devices_found:
             if dev.name == 'Unknown':
                 try:
-                    name = await asyncio.wait_for(
-                        self.device.request_remote_name(Address(dev.address)),
-                        timeout=3.0
-                    )
+                    name = await self._remote_name(dev.address)
                     if name:
                         dev.name = name
                 except Exception:
