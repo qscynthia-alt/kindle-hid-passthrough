@@ -138,7 +138,6 @@ class HIDHost(ClassicMixin, BLEMixin):
     ACTIVE_RETRY_INTERVAL = 5.0
     ACTIVE_RETRY_INTERVAL_CONNECTED = 60.0
     ACTIVE_CONNECT_TIMEOUT = 10
-    FIRST_SESSION_TIMEOUT = 60.0
     SETUP_TIMEOUT = 45.0
 
     def __init__(self, transport_spec: str = None):
@@ -360,10 +359,6 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         log.info(f"Serving devices (Classic: {len(self.classic_devices)}, BLE: {len(self.ble_devices)})")
 
-        if self.classic_devices or self.ble_devices:
-            tasks.append(asyncio.create_task(
-                self._session_watchdog(), name="session_watchdog"))
-
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -382,30 +377,6 @@ class HIDHost(ClassicMixin, BLEMixin):
             if pending:
                 raise RuntimeError("Protocol handlers did not stop; transport release refused")
             self._handler_tasks = []
-
-    async def _session_watchdog(self):
-        """Ask the daemon for a transport rebuild if nothing ever connects.
-
-        Once a device has connected, an empty session set is a device that
-        went to sleep, not a broken transport: the handlers keep initiating
-        on the open radio, so rebuilding would only make us deaf for a while.
-        """
-        had_session = False
-        while True:
-            self._sessions_changed.clear()
-            media_alive = bool(self.media_remote
-                               and self.media_remote.connections)
-            if self.sessions or media_alive or had_session:
-                had_session = True
-                await self._sessions_changed.wait()
-                continue
-            try:
-                await asyncio.wait_for(
-                    self._sessions_changed.wait(),
-                    timeout=self.FIRST_SESSION_TIMEOUT)
-            except asyncio.TimeoutError:
-                log.warning("Connection timeout - no device connected")
-                raise InvalidStateError("No device connected within timeout")
 
     def _notify_sessions_changed(self):
         if self._sessions_changed:
@@ -549,6 +520,9 @@ class HIDHost(ClassicMixin, BLEMixin):
         if protocol is None:
             protocol = Protocol.BLE
 
+        self._radio_lock = asyncio.Lock()
+        self._sessions_changed = asyncio.Event()
+
         self._parse_devices()
 
         bucket = self.classic_devices if protocol == Protocol.CLASSIC else self.ble_devices
@@ -562,6 +536,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             return await self._pair_classic(address)
         else:
             return await self._pair_ble(address)
+
+    def _retain_pair_connection(self, connection, protocol):
+        """A cancelled pairing may win the link race; retain it for cleanup only."""
+        self._pairing_session = self._new_session(
+            normalize_addr(str(connection.peer_address)), protocol, connection)
 
     async def continue_after_pairing(self):
         """Serve all configured devices, adopting the paired session."""
@@ -662,6 +641,16 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     async def cleanup(self):
         """Clean up resources."""
+        hci_host = getattr(getattr(self, 'device', None), 'host', None)
+        if getattr(hci_host, '_command_fault', None):
+            raise RuntimeError('HCI command response unconfirmed; transport release refused')
+        commands = list(getattr(hci_host, '_command_transactions', ()))
+        if commands:
+            await asyncio.wait(commands)
+            if getattr(hci_host, '_command_fault', None):
+                raise RuntimeError('HCI command response unconfirmed; transport release refused')
+        if getattr(self, '_radio_attempts', None):
+            raise RuntimeError('Controller attempt unresolved; transport cleanup refused')
         if any(not task.done() for task in getattr(self, '_handler_tasks', [])):
             raise RuntimeError("Live protocol handler; refusing concurrent transport cleanup")
         if self._connection_tasks:
@@ -703,6 +692,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._classic_connection_listener = None
 
         if self.transport:
+            commands = list(getattr(hci_host, '_command_transactions', ()))
+            if commands:
+                await asyncio.wait(commands)
+            if getattr(hci_host, '_command_fault', None):
+                raise RuntimeError('HCI command response unconfirmed; transport release refused')
             try:
                 await asyncio.wait_for(self.transport.close(), timeout=3.0)
             except asyncio.TimeoutError:

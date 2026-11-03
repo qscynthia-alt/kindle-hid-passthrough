@@ -39,6 +39,10 @@ class HIDDaemon:
         self._fault_stop = asyncio.Event()
         self._resume_event = asyncio.Event()
         self._paired_host = None
+        self._release_task = None
+        self._release_fault = None
+        self._resume_after_release = False
+        self._operation_owner = None
         # Set in main(): called with True/False as a pointer device connects/leaves.
         self.on_pointer_change = None
 
@@ -51,30 +55,89 @@ class HIDDaemon:
 
     async def suspend(self):
         """Disconnect and release transport for scan/pair."""
-        if self.worker_fault:
+        if self.worker_fault and self.worker_fault != self._release_fault:
             raise RuntimeError(self.worker_fault)
         logger.info("Daemon suspending...")
         self._suspended = True
+        self._resume_after_release = False
         self._resume_event.clear()
+        task = self._begin_release()
+        await self._wait_release(task)
 
-        # Cancel the host task first — this stops host.run()'s connect loop
-        if self._host_task and not self._host_task.done():
-            self._host_task.cancel()
-            if not await self._abandon_after_timeout(self._host_task, "host task"):
-                self.worker_fault = "Host task did not stop; Bluetooth operations blocked"
+    async def _wait_release(self, task):
+        if task is None:
+            return
+        await self._abandon_after_timeout(task, 'controller drain')
+        if task.done():
+            self._release_completed(task)
+            if task.cancelled() or task.exception() is not None:
                 raise RuntimeError(self.worker_fault)
-            self._host_task = None
+            return
+        self._release_fault = 'Controller drain pending; waiting for physical completion'
+        self.worker_fault = self._release_fault
+        raise RuntimeError(self.worker_fault)
 
-        # Then clean up any remaining resources
-        if self.host:
-            self._cleanup_task = asyncio.ensure_future(self.host.cleanup())
-            if not await self._abandon_after_timeout(self._cleanup_task, "host cleanup"):
-                self.worker_fault = "Host cleanup did not stop; Bluetooth operations blocked"
-                raise RuntimeError(self.worker_fault)
+    def _begin_release(self):
+        """One retained release transaction; repeated requests never replay it."""
+        if self._release_task is not None and not self._release_task.done():
+            return self._release_task
+        if self._release_task is not None and (self._release_task.cancelled() or self._release_task.exception() is not None):
+            return self._release_task
+        owner = self._operation_owner or self.host
+        if owner is None:
+            self.transport_released = True
+            return None
+        host, worker = owner, self._host_task
+        self._release_task = asyncio.create_task(self._release_host(host, worker))
+        self._release_task.add_done_callback(self._release_completed)
+        return self._release_task
+
+    async def _release_host(self, host, worker):
+        if worker is not None and not worker.done():
+            worker.cancel()
+            await asyncio.wait({worker})
+        if worker is not None and not worker.cancelled():
+            worker.exception()
+        handlers = [t for t in getattr(host, '_handler_tasks', ()) if not t.done()]
+        if handlers:
+            await asyncio.wait(handlers)
+        owners = [o.task for o in getattr(host, '_radio_attempts', ())]
+        if owners:
+            await asyncio.wait(owners)
+            # Host.cleanup still refuses an owner whose task failed without
+            # establishing hardware completion; never infer idle from done().
+        setup = [t for t in getattr(host, '_connection_tasks', ()) if not t.done()]
+        for task in setup:
+            task.cancel()
+        if setup:
+            await asyncio.wait(setup)
+        commands = list(getattr(getattr(getattr(host, 'device', None), 'host', None), '_command_transactions', ()))
+        if commands:
+            await asyncio.wait(commands)
+        await host.cleanup()
+        if self.host is host:
             self.host = None
-
+            self._host_task = None
+        if self._operation_owner is host:
+            self._operation_owner = None
         self.transport_released = True
-        logger.info("Daemon suspended")
+
+    def _release_completed(self, task):
+        if task is not self._release_task:
+            return
+        if task.cancelled():
+            self.worker_fault = 'Controller drain interrupted; ownership unconfirmed'
+            return
+        error = task.exception()
+        if error is not None:
+            self.worker_fault = 'Transport release unverified: ' + str(error)
+            return
+        if self.worker_fault == self._release_fault:
+            self.worker_fault = None
+        self._release_fault = None
+        if self._resume_after_release and self.running and not self.worker_fault:
+            self._suspended = False
+            self._resume_event.set()
 
     @staticmethod
     async def _abandon_after_timeout(task, what):
@@ -98,27 +161,36 @@ class HIDDaemon:
     async def scan(self, duration=10.0, on_device_found=None):
         """Scan for BT devices. Must be called while suspended."""
         scanner = Scanner()
+        if self._operation_owner is not None:
+            raise RuntimeError('Previous scan/pair still owns transport')
+        self._operation_owner = scanner
+        self.transport_released = False
         if on_device_found:
             scanner.on_device_found = on_device_found
         try:
             await scanner.start()
             await scanner.scan(duration=duration)
         finally:
-            await scanner.cleanup()
+            await self._wait_release(self._begin_release())
 
     async def pair(self, address, protocol, name=None) -> bool:
         """Pair with a device. Must be called while suspended."""
         host = HIDHost()
+        if self._operation_owner is not None:
+            raise RuntimeError('Previous scan/pair still owns transport')
+        self._operation_owner = host
+        self.transport_released = False
+        success = False
         try:
             success = await host.pair_device(address, protocol, name)
             if success:
                 self._paired_host = host
+                self._operation_owner = None
                 return True
-            await host.cleanup()
             return False
-        except Exception:
-            await host.cleanup()
-            raise
+        finally:
+            if not success:
+                await self._wait_release(self._begin_release())
 
     async def disconnect(self, address=None):
         """Drop one session by address, or all; daemon keeps running and
@@ -130,11 +202,17 @@ class HIDDaemon:
 
     async def resume(self):
         """Resume connections after scan/pair."""
+        self._resume_after_release = True
+        if self._release_task is not None and not self._release_task.done():
+            return False
+        if self._release_task is not None:
+            self._release_completed(self._release_task)
         if self.worker_fault:
             raise RuntimeError(self.worker_fault)
         logger.info("Daemon resuming...")
         self._suspended = False
         self._resume_event.set()
+        return True
 
     def _has_devices(self, log_details=False) -> bool:
         """Check if any devices are configured."""
@@ -163,8 +241,23 @@ class HIDDaemon:
 
         while self.running:
             if self.worker_fault:
-                await self._fault_stop.wait()
-                break
+                release = self._release_task
+                if release is not None and release.done() and self.worker_fault == self._release_fault:
+                    self._release_completed(release)
+                    if not self.worker_fault:
+                        continue
+                if release is None or release.done() or self.worker_fault != self._release_fault:
+                    await self._fault_stop.wait()
+                    break
+                stop = asyncio.create_task(self._fault_stop.wait())
+                try:
+                    await asyncio.wait({release, stop}, return_when=asyncio.FIRST_COMPLETED)
+                    if self._fault_stop.is_set():
+                        break
+                finally:
+                    stop.cancel()
+                    await asyncio.gather(stop, return_exceptions=True)
+                continue
             # Wait for devices if none configured or after suspend
             if self._suspended:
                 logger.info("Daemon suspended, waiting for resume...")
@@ -229,13 +322,13 @@ class HIDDaemon:
                 # parallel and deadlock on transport/connection teardown.
                 if self.host and not self._suspended and not self.worker_fault:
                     try:
-                        await self.host.cleanup()
+                        self._resume_after_release = True
+                        task = self._begin_release()
+                        await self._wait_release(task)
                     except Exception as exc:
-                        self.worker_fault = "Transport cleanup unverified: " + str(exc)
+                        if self.worker_fault != self._release_fault:
+                            self.worker_fault = "Transport cleanup unverified: " + str(exc)
                         self._suspended = True
-                    else:
-                        self.host = None
-                        self.transport_released = True
 
             if not self.running:
                 break
@@ -261,6 +354,7 @@ class HIDDaemon:
         """Stop the daemon."""
         logger.info("Stopping...")
         self.running = False
+        self._resume_after_release = False
         self.connection_policy = {}
         self._fault_stop.set()
         # Wake up if suspended (waiting on _resume_event)
