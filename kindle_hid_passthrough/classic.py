@@ -8,15 +8,21 @@ from bumble.core import BT_BR_EDR_TRANSPORT, BT_HUMAN_INTERFACE_DEVICE_SERVICE, 
 from bumble.core import TimeoutError as BumbleTimeoutError
 from bumble.hci import (
     Address,
+    HCI_Error,
     HCI_Write_Scan_Enable_Command,
+    HCI_Create_Connection_Cancel_Command,
+    HCI_Create_Connection_Command,
+    HCI_R2_PAGE_SCAN_REPETITION_MODE,
     Role,
 )
 from bumble.hid import HID_CONTROL_PSM, HID_INTERRUPT_PSM, Message, SetProtocolMessage
+from bumble.device import Connection
 from bumble.l2cap import ClassicChannelSpec
 from bumble.sdp import Client as SDPClient
 
 from config import Protocol, clean_device_name, config, normalize_addr
 from logging_utils import errstr, log
+from radio_attempt import RadioAttempt
 
 # HIDP DATA header, OUTPUT report type.
 HIDP_DATA_OUTPUT = 0xA2
@@ -301,6 +307,45 @@ class ClassicMixin:
 
         return False
 
+    async def _classic_initiate(self, target, window, retry=None, locked=False, abandon=None):
+        if not locked:
+            await self._radio_lock.acquire()
+        pending = asyncio.get_running_loop().create_future()
+
+        def on_connection(connection):
+            if (connection.transport == BT_BR_EDR_TRANSPORT
+                    and connection.peer_address == target and not pending.done()):
+                pending.set_result(connection)
+
+        def on_failure(error):
+            if (error.transport == BT_BR_EDR_TRANSPORT
+                    and error.peer_address == target and not pending.done()):
+                pending.set_exception(error)
+
+        self.device.on('connection', on_connection)
+        self.device.on('connection_failure', on_failure)
+        self.device.pending_connections[target] = Connection(
+            device=self.device, handle=0, transport=BT_BR_EDR_TRANSPORT,
+            self_address=self.device.public_address, self_resolvable_address=None,
+            peer_address=target, peer_resolvable_address=None,
+            role=Role.CENTRAL, parameters=Connection.Parameters(0, 0, 0))
+
+        def detach():
+            self.device.remove_listener('connection', on_connection)
+            self.device.remove_listener('connection_failure', on_failure)
+            self.device.pending_connections.pop(target, None)
+
+        owner = RadioAttempt(
+            self, pending,
+            lambda: self.device.host.send_async_command(HCI_Create_Connection_Command(
+                bd_addr=target, packet_type=0xCC18,
+                page_scan_repetition_mode=HCI_R2_PAGE_SCAN_REPETITION_MODE,
+                clock_offset=0, allow_role_switch=1, reserved=0)),
+            lambda: self.device.host.send_sync_command(
+                HCI_Create_Connection_Cancel_Command(bd_addr=target)),
+            detach, abandon=abandon, rejection_errors=(HCI_Error,))
+        return await owner.wait(window, retry)
+
     async def _classic_active_connect_loop(self):
         """Actively page configured Classic devices lacking a session."""
         await asyncio.sleep(self.ACTIVE_DELAY)
@@ -335,65 +380,13 @@ class ClassicMixin:
                     self._radio_lock.release()
                     manual_retry = True
                     break
-                connect_task = asyncio.create_task(
-                    self.device.connect(target, transport=BT_BR_EDR_TRANSPORT)
-                )
-                retry_task = asyncio.create_task(self._classic_retry_event.wait())
-                # The finally below guarantees connect_task is cancelled and
-                # awaited on every exit path, including suspend cancellation,
-                # otherwise it leaks and asyncio logs an unretrieved exception
-                # when bumble eventually raises HCI_PAGE_TIMEOUT.
                 try:
-                    timed_out = True
-                    retry_requested = False
-                    for _ in range(self.ACTIVE_CONNECT_TIMEOUT):
-                        done, _ = await asyncio.wait(
-                            [connect_task, retry_task], timeout=0.5,
-                            return_when=asyncio.FIRST_COMPLETED)
-                        if retry_task in done:
-                            self._classic_retry_event.clear()
-                            retry_requested = True
-                            timed_out = False
-                            break
-                        if connect_task in done:
-                            timed_out = False
-                            break
-
-                    if retry_requested:
-                        log.info(f"[Classic] Retrying {addr} on manual request")
-                        manual_retry = True
-                    elif timed_out:
-                        log.info(f"[Classic] {addr} timed out")
-                        await asyncio.sleep(3.0)
-                    else:
-                        await connect_task
-
-                except Exception as e:
-                    msg = str(e)
-                    if "CONNECTION_ALREADY_EXISTS" in msg:
-                        log.info("[Classic] Peer paged us first; yielding to incoming link")
-                        await asyncio.sleep(2.0)
-                    elif "DISALLOWED" in msg or "PENDING" in msg:
-                        log.warning("[Classic] HCI busy, waiting...")
-                        await asyncio.sleep(5.0)
-                    else:
-                        log.info(f"[Classic] Connect failed: {e}")
-                        await asyncio.sleep(2.0)
-
+                    await self._classic_initiate(target, self.ACTIVE_CONNECT_TIMEOUT * 0.5,
+                                                 self._classic_retry_event, locked=True)
+                    manual_retry = self._classic_retry_event.is_set()
+                    if manual_retry:
+                        self._classic_retry_event.clear()
                 finally:
-                    if not connect_task.done():
-                        connect_task.cancel()
-                    try:
-                        await connect_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    if not retry_task.done():
-                        retry_task.cancel()
-                    try:
-                        await retry_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    self._radio_lock.release()
                     self._classic_active_address = None
 
                 if manual_retry:
@@ -481,11 +474,11 @@ class ClassicMixin:
 
         try:
             target_address = Address(address, Address.PUBLIC_DEVICE_ADDRESS)
-            connection = await self.device.connect(
-                target_address,
-                transport=BT_BR_EDR_TRANSPORT,
-                timeout=config.connect_timeout,
-            )
+            connection = await self._classic_initiate(
+                target_address, config.connect_timeout,
+                abandon=lambda conn: self._retain_pair_connection(conn, Protocol.CLASSIC))
+            if connection is None:
+                return False
             log.success(f"[Classic] Connected to {address}")
         except (asyncio.TimeoutError, BumbleTimeoutError):
             log.error(f"[Classic] Connection timeout after {config.connect_timeout}s")

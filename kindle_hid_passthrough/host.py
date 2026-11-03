@@ -549,6 +549,9 @@ class HIDHost(ClassicMixin, BLEMixin):
         if protocol is None:
             protocol = Protocol.BLE
 
+        self._radio_lock = asyncio.Lock()
+        self._sessions_changed = asyncio.Event()
+
         self._parse_devices()
 
         bucket = self.classic_devices if protocol == Protocol.CLASSIC else self.ble_devices
@@ -562,6 +565,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             return await self._pair_classic(address)
         else:
             return await self._pair_ble(address)
+
+    def _retain_pair_connection(self, connection, protocol):
+        """A cancelled pairing may win the link race; retain it for cleanup only."""
+        self._pairing_session = self._new_session(
+            normalize_addr(str(connection.peer_address)), protocol, connection)
 
     async def continue_after_pairing(self):
         """Serve all configured devices, adopting the paired session."""
@@ -662,6 +670,16 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     async def cleanup(self):
         """Clean up resources."""
+        hci_host = getattr(getattr(self, 'device', None), 'host', None)
+        if getattr(hci_host, '_command_fault', None):
+            raise RuntimeError('HCI command response unconfirmed; transport release refused')
+        commands = list(getattr(hci_host, '_command_transactions', ()))
+        if commands:
+            await asyncio.wait(commands)
+            if getattr(hci_host, '_command_fault', None):
+                raise RuntimeError('HCI command response unconfirmed; transport release refused')
+        if getattr(self, '_radio_attempts', None):
+            raise RuntimeError('Controller attempt unresolved; transport cleanup refused')
         if any(not task.done() for task in getattr(self, '_handler_tasks', [])):
             raise RuntimeError("Live protocol handler; refusing concurrent transport cleanup")
         if self._connection_tasks:
@@ -703,6 +721,11 @@ class HIDHost(ClassicMixin, BLEMixin):
             self._classic_connection_listener = None
 
         if self.transport:
+            commands = list(getattr(hci_host, '_command_transactions', ()))
+            if commands:
+                await asyncio.wait(commands)
+            if getattr(hci_host, '_command_fault', None):
+                raise RuntimeError('HCI command response unconfirmed; transport release refused')
             try:
                 await asyncio.wait_for(self.transport.close(), timeout=3.0)
             except asyncio.TimeoutError:

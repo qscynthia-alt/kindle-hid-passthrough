@@ -20,14 +20,17 @@ from bumble.gatt import (
 )
 from bumble.hci import (
     Address,
+    HCI_Error,
     HCI_LE_Add_Device_To_Filter_Accept_List_Command,
     HCI_LE_Clear_Filter_Accept_List_Command,
     HCI_LE_Create_Connection_Cancel_Command,
     HCI_LE_Create_Connection_Command,
     OwnAddressType,
+    Role,
 )
 
 from config import Protocol, config, normalize_addr, clean_device_name
+from radio_attempt import RadioAttempt, RadioScan
 from logging_utils import log
 
 HID_REPORT_TYPE_INPUT = 1
@@ -65,6 +68,13 @@ class BLEMixin:
             current = getattr(current, 'cr_await', None) or getattr(current, 'gi_yieldfrom', None)
         progress['await_chain'] = chain
         progress['recent_link_events'] = list(getattr(self, '_ble_link_events', []))
+        progress['radio_owners'] = [
+            {'state': owner.state, 'caller_stopped': owner.abandoned,
+             'result_received': owner.pending.done() and not owner.pending.cancelled()}
+            for owner in tuple(getattr(self, '_radio_attempts', ()))]
+        hci_host = getattr(getattr(self, 'device', None), 'host', None)
+        progress['hci_commands_pending'] = sum(not t.done() for t in tuple(getattr(hci_host, '_command_transactions', ())))
+        progress['hci_command_fault'] = getattr(hci_host, '_command_fault', None)
         return progress
 
     async def _run_ble_handler(self):
@@ -105,6 +115,8 @@ class BLEMixin:
 
     async def _seed_accept_list(self, missing):
         """Load the filter accept list with every address we may connect to."""
+        if self.device.address_resolution_offload:
+            await self._set_device_privacy_modes()
         await self.device.send_command(
             HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
 
@@ -305,13 +317,14 @@ class BLEMixin:
                 except Exception as e:
                     log.warning(f"[BLE] Battery poll failed for {session.address}: {e}")
 
-    async def _ble_initiate(self, window: float, peer: Address = None):
+    async def _ble_initiate(self, window: float, peer: Address = None, pairing=False):
         """Legacy create-connection to `peer`, or to the accept list when
         None. Returns the connection, or None on window timeout."""
         pending = asyncio.get_running_loop().create_future()
 
         def on_connection(connection):
-            if connection.transport == BT_LE_TRANSPORT and not pending.done():
+            if (connection.transport == BT_LE_TRANSPORT
+                    and connection.role == Role.CENTRAL and not pending.done()):
                 pending.set_result(connection)
 
         def on_failure(error):
@@ -330,12 +343,17 @@ class BLEMixin:
         self.device.on(Device.EVENT_CONNECTION, on_connection)
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
 
-        try:
-            self.device.connect_own_address_type = OwnAddressType.PUBLIC
-            self.device.le_connecting = True
+        self.device.connect_own_address_type = OwnAddressType.PUBLIC
+        self.device.le_connecting = True
 
+        def detach():
+            self.device.le_connecting = False
+            self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
+            self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
+
+        async def create():
             self._mark_ble('sending_create_connection')
-            await self.device.send_command(
+            await self.device.host.send_command(
                 HCI_LE_Create_Connection_Command(
                     le_scan_interval=96,
                     le_scan_window=96,
@@ -351,35 +369,12 @@ class BLEMixin:
                     max_ce_length=0,
                 ), check_result=True)
 
-            result = None
-            try:
-                self._mark_ble('waiting_connection_event')
-                result = await asyncio.wait_for(asyncio.shield(pending), timeout=window)
-            except asyncio.TimeoutError:
-                pass
-
-        finally:
-            try:
-                if not pending.done():
-                    try:
-                        self._mark_ble('cancelling_create_connection')
-                        await self.device.send_command(
-                            HCI_LE_Create_Connection_Cancel_Command())
-                        self._mark_ble('waiting_cancel_event')
-                        await asyncio.wait_for(asyncio.shield(pending), timeout=1.0)
-                    except Exception:
-                        pass
-                # The connection can win the race against create-connection
-                # cancellation. Return that link to the caller for admission;
-                # returning None before finally silently orphaned the link.
-                if pending.done() and not pending.cancelled() and pending.exception() is None:
-                    result = pending.result()
-            finally:
-                self.device.le_connecting = False
-                self.device.remove_listener(Device.EVENT_CONNECTION, on_connection)
-                self.device.remove_listener(Device.EVENT_CONNECTION_FAILURE, on_failure)
-                self._radio_lock.release()
-        return result
+        owner = RadioAttempt(
+            self, pending, create,
+            lambda: self.device.host.send_command(HCI_LE_Create_Connection_Cancel_Command(), check_result=True),
+            detach, abandon=(lambda conn: self._retain_pair_connection(conn, Protocol.BLE)) if pairing else self._admit_ble_connection,
+            rejection_errors=(HCI_Error,))
+        return await owner.wait(window)
 
     async def _ble_scan_for_rotated(self, known: set, window: float):
         """Scan for bonded devices advertising, including from a rotated
@@ -396,32 +391,21 @@ class BLEMixin:
         self._mark_ble('waiting_radio_lock')
         await self._radio_lock.acquire()
         self.device.on('advertisement', on_advertisement)
-        scanning = False
-        try:
+
+        async def start():
             self._mark_ble('rotation_scan')
             await self.device.start_scanning(
                 legacy=True,
                 own_address_type=OwnAddressType.PUBLIC,
                 filter_duplicates=True,
             )
-            scanning = True
-            try:
-                return await asyncio.wait_for(rotated, timeout=window)
-            except asyncio.TimeoutError:
-                return None
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log.warning(f"[BLE] Rotation scan failed: {e}")
-            return None
-        finally:
+
+        def detach():
             self.device.remove_listener('advertisement', on_advertisement)
-            if scanning:
-                try:
-                    await self.device.stop_scanning(legacy=True)
-                except Exception:
-                    pass
-            self._radio_lock.release()
+
+        return await RadioScan(self, rotated, start,
+                               lambda: self.device.stop_scanning(legacy=True),
+                               detach).wait(window)
 
     def _match_rotated_ble_device(self, advertisement, known: set):
         """Match an advertisement by known address, IRK resolution, or
@@ -474,6 +458,7 @@ class BLEMixin:
 
         while True:
             found_device = None
+            found = asyncio.get_running_loop().create_future()
 
             def on_advertisement(advertisement):
                 nonlocal found_device
@@ -485,36 +470,25 @@ class BLEMixin:
                     return
                 if not target_addresses or addr in target_addresses:
                     found_device = advertisement
+                    if not found.done():
+                        found.set_result(advertisement)
                     log.info(f"[BLE] Found target: {addr}")
 
+            await self._radio_lock.acquire()
             self.device.on('advertisement', on_advertisement)
-
-            try:
-                async with self._radio_lock:
-                    await self.device.start_scanning()
-                    for _ in range(20):
-                        if found_device:
-                            break
-                        await asyncio.sleep(0.5)
-                    await self.device.stop_scanning()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning(f"[BLE] Scan error: {e}")
-            finally:
-                self.device.remove_listener('advertisement', on_advertisement)
+            await RadioScan(self, found, self.device.start_scanning,
+                            self.device.stop_scanning,
+                            lambda: self.device.remove_listener('advertisement', on_advertisement)).wait(10.0)
 
             if found_device:
                 max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
                     try:
                         log.info(f"[BLE] Connecting to {found_device.address} (Attempt {attempt}/{max_attempts})...")
-                        async with self._radio_lock:
-                            connection = await self.device.connect(
-                                found_device.address,
-                                own_address_type=OwnAddressType.PUBLIC,
-                                timeout=config.connect_timeout,
-                            )
+                        connection = await self._ble_initiate(
+                            config.connect_timeout, peer=found_device.address)
+                        if connection is None:
+                            continue
                         self._admit_ble_connection(connection)
                         break
                     except asyncio.CancelledError:
@@ -664,11 +638,9 @@ class BLEMixin:
 
         target = Address(address)
         try:
-            connection = await self.device.connect(
-                target,
-                own_address_type=OwnAddressType.PUBLIC,
-                timeout=config.connect_timeout,
-            )
+            connection = await self._ble_initiate(config.connect_timeout, peer=target, pairing=True)
+            if connection is None:
+                return False
         except Exception as e:
             log.error(f"[BLE] Connection failed: {e}")
             return False

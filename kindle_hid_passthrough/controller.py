@@ -81,6 +81,14 @@ class DaemonController:
         conn = self.daemon.connection_state
         status["connections"] = conn.get("connections", [])
         host = self.daemon.host
+        hci_host = getattr(getattr(host, 'device', None), 'host', None)
+        hci_fault = getattr(hci_host, '_command_fault', None)
+        if hci_fault:
+            status['worker_fault'] = hci_fault
+            status['worker_state'] = 'faulted'
+            status['daemon_running'] = False
+        release = getattr(self.daemon, '_release_task', None)
+        status['recovery_pending'] = bool(release is not None and not release.done())
         status["ble_diagnostics"] = host.ble_diagnostics() if host is not None and hasattr(host, 'ble_diagnostics') else None
 
         for target, connection in list(self._connection_unconfirmed.items()):
@@ -188,9 +196,6 @@ class DaemonController:
         return await host.make_discoverable(duration)
 
     async def _resume_if_enabled(self):
-        if self.daemon.worker_fault:
-            logger.error("HID worker fault; manual process recovery required: %s", self.daemon.worker_fault)
-            return
         """Resume unless BT was toggled off while the op ran."""
         if self.bt_enabled:
             await self.daemon.resume()
@@ -427,10 +432,11 @@ class DaemonController:
             # must, or the peer holds a dead link and stops page scanning.
             if keeps_radio and event != 'readyToSuspend':
                 return
+            self._suspended_by_system = True
             if self.daemon._suspended:
+                self.daemon._resume_after_release = False
                 return
             logger.info(f"System suspend ({event}): releasing BT")
-            self._suspended_by_system = True
             await self.daemon.suspend()
             if not keeps_radio:
                 chip().power_off()
