@@ -2,6 +2,7 @@
 """HID Host — runs BLE + Classic handlers on a single Bumble device."""
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -55,6 +56,9 @@ class DeviceSession:
         self.uhid_device = None
         self.is_pointer = False
         self.last_report = None
+        self.input_report_count = 0
+        self.last_input_at = None
+        self.hid_ready = False
         self.setup_task = None
         self.closed = False
         self.teardown_done = asyncio.Event()
@@ -79,7 +83,9 @@ class DeviceSession:
             "address": self.address,
             "protocol": self.protocol.value,
             "name": self.name,
-            "hid_ready": self.uhid_device is not None,
+            "hid_ready": self.uhid_device is not None and self.hid_ready,
+            "input_report_count": self.input_report_count,
+            "last_input_age_seconds": round(max(0, time.monotonic() - self.last_input_at), 3) if self.last_input_at is not None else None,
         }
         if self.uhid_device:
             entry["uhid_name"] = self.uhid_device.name
@@ -168,6 +174,34 @@ class HIDHost(ClassicMixin, BLEMixin):
 
         self._sessions_changed = None
         self._radio_lock = None
+        self.reconnect_policy = None
+        self._system_link_events = []
+
+    def _reconnect_allowed(self, address, protocol):
+        policy = self.reconnect_policy
+        return policy is None or policy.allowed(address, protocol)
+
+    def _request_manual_peer(self, address, protocol):
+        if self.reconnect_policy is not None:
+            self.reconnect_policy.request(address, protocol)
+        # Wake both selectors; physical owners still drain through their normal path.
+        for name in ('_classic_retry_event', '_ble_retry_event'):
+            event = getattr(self, name, None)
+            if event is not None:
+                event.set()
+
+    def _select_ready_peer(self, address, protocol):
+        session = self.sessions.get(normalize_addr(address))
+        if session is None or not session.is_alive() or not session.hid_ready:
+            return False
+        if session.protocol.value != protocol or self.reconnect_policy is None:
+            return False
+        generation = self.reconnect_policy.request(address, protocol)
+        return self.reconnect_policy.ready(address, protocol, generation)
+
+    def record_system_link_event(self, event):
+        self._system_link_events = (self._system_link_events + [
+            {'event': event, 'at': round(time.monotonic(), 3)}])[-16:]
 
     @property
     def connection_state(self) -> dict:
@@ -391,7 +425,10 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     def _new_session(self, address: str, protocol: Protocol, connection) -> DeviceSession:
         """Session factory for the protocol mixins (avoids circular imports)."""
-        return DeviceSession(address, protocol, connection)
+        session = DeviceSession(address, protocol, connection)
+        policy = self.reconnect_policy
+        session.reconnect_generation = policy.generation(address, protocol) if policy is not None else 0
+        return session
 
     def _register_session(self, session: DeviceSession):
         self.sessions[session.address] = session
@@ -421,6 +458,7 @@ class HIDHost(ClassicMixin, BLEMixin):
         """Drive a session's HID setup, tearing it down on failure."""
         try:
             await asyncio.wait_for(setup, timeout=self.SETUP_TIMEOUT)
+            self._mark_hid_ready(session)
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
@@ -558,6 +596,7 @@ class HIDHost(ClassicMixin, BLEMixin):
                 await self._continue_classic_after_pairing(session)
             else:
                 await self._continue_ble_after_pairing(session)
+            self._mark_hid_ready(session)
             proto_name = session.protocol.value.upper()
             log.success(f"\n[{proto_name}] Paired and receiving HID reports.")
         else:
@@ -569,8 +608,26 @@ class HIDHost(ClassicMixin, BLEMixin):
 
     # ==================== COMMON ====================
 
+    def _mark_hid_ready(self, session):
+        if session.closed or not session.is_alive() or session.uhid_device is None:
+            return
+        session.hid_ready = True
+        if self.reconnect_policy is None:
+            return
+        identity = getattr(session, 'reconnect_identity', session.address)
+        if self.reconnect_policy.ready(session.address, session.protocol,
+                                       session.reconnect_generation, identity):
+            log.info(f'Automatic reconnect target: {session.address} [{session.protocol.value}] (HID ready)')
+            for event_name in ('_classic_retry_event', '_ble_retry_event'):
+                event = getattr(self, event_name, None)
+                if event is not None:
+                    event.set()
+
     def _forward_report(self, session: DeviceSession, data: bytes):
         """Deduplicate the log line and forward an HID report to UHID."""
+        session.input_report_count += 1
+        session.last_input_at = time.monotonic()
+        session.connection._hid_last_input_at = session.last_input_at
         if data != session.last_report:
             log.debug(f"Report: {data.hex()}")
             session.last_report = data

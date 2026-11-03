@@ -184,6 +184,9 @@ class ClassicMixin:
                 return
 
             addr = normalize_addr(addr_str)
+            if hasattr(self, '_reconnect_allowed') and not self._reconnect_allowed(addr, 'classic'):
+                self._track_task(asyncio.create_task(self._reject_connection(connection)))
+                return
             old = self.sessions.get(addr)
             session = self._new_session(addr, Protocol.CLASSIC, connection)
             session.channels = ClassicHIDChannels(
@@ -216,8 +219,14 @@ class ClassicMixin:
             self._classic_preferred_address
             or getattr(self, '_classic_active_address', None)
             or (allowed[0] if allowed else None))
+        policy = getattr(self, 'reconnect_policy', None)
+        if address is None and policy is not None:
+            last = policy.snapshot()['last_successful']
+            target = last['address'] if last and last['protocol'] == 'classic' else None
         if target not in allowed:
             return False
+        if hasattr(self, '_request_manual_peer'):
+            self._request_manual_peer(target, 'classic')
         self._classic_preferred_address = target
         event.set()
         return target
@@ -358,6 +367,7 @@ class ClassicMixin:
             attempt += 1
             manual_retry = False
             addresses = [d.address for d in self.classic_devices if d.address != '*'
+                         and (not hasattr(self, '_reconnect_allowed') or self._reconnect_allowed(d.address, 'classic'))
                          and getattr(self, 'connection_policy', {}).get((normalize_addr(d.address), 'classic')) != 'disconnect']
             preferred = getattr(self, '_classic_preferred_address', None)
             if preferred:
@@ -376,6 +386,9 @@ class ClassicMixin:
                 target = Address(addr, Address.PUBLIC_DEVICE_ADDRESS)
                 self._classic_active_address = normalize_addr(addr)
                 await self._radio_lock.acquire()
+                if hasattr(self, '_reconnect_allowed') and not self._reconnect_allowed(addr, 'classic'):
+                    self._radio_lock.release()
+                    continue
                 if time.monotonic() < getattr(self, '_ble_manual_priority_until', 0.0):
                     self._radio_lock.release()
                     manual_retry = True

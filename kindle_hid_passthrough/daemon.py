@@ -3,6 +3,7 @@
 
 import asyncio
 import logging
+import os
 import signal
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from host import HIDHost
 from logging_utils import errstr, log, setup_daemon_logging
 from power_monitor import PowerMonitor
 from scanner import Scanner
+from reconnect_policy import ReconnectPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,7 @@ class HIDDaemon:
     def __init__(self):
         self.running = False
         self.connection_policy = {}
+        self.reconnect_policy = ReconnectPolicy(os.path.join(config.base_path, 'last-hid-device.json'))
         self.host = None
         self._host_task = None
         self._suspended = False
@@ -176,6 +179,8 @@ class HIDDaemon:
     async def pair(self, address, protocol, name=None) -> bool:
         """Pair with a device. Must be called while suspended."""
         host = HIDHost()
+        host.reconnect_policy = self.reconnect_policy
+        self.reconnect_policy.request(address, protocol)
         if self._operation_owner is not None:
             raise RuntimeError('Previous scan/pair still owns transport')
         self._operation_owner = host
@@ -184,6 +189,8 @@ class HIDDaemon:
         try:
             success = await host.pair_device(address, protocol, name)
             if success:
+                session = host._pairing_session
+                session.reconnect_generation = self.reconnect_policy.request(session.address, session.protocol)
                 self._paired_host = host
                 self._operation_owner = None
                 return True
@@ -288,6 +295,7 @@ class HIDDaemon:
                     self.host = self._paired_host
                     self._paired_host = None
                     self.host.connection_policy = self.connection_policy
+                    self.host.reconnect_policy = self.reconnect_policy
                     self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.continue_after_pairing()
@@ -297,6 +305,7 @@ class HIDDaemon:
                     self.transport_released = False
                     self.host = HIDHost()
                     self.host.connection_policy = self.connection_policy
+                    self.host.reconnect_policy = self.reconnect_policy
                     self.host.on_pointer_change = self.on_pointer_change
                     self._host_task = asyncio.create_task(
                         self.host.run()

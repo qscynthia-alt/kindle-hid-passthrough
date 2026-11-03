@@ -97,6 +97,8 @@ class BLEMixin:
         task = getattr(self, '_ble_handler_task', None)
         if task is None or task.done():
             return False
+        if hasattr(self, '_request_manual_peer'):
+            self._request_manual_peer(address, 'ble')
         self._ble_preferred_address = address
         self._ble_manual_priority_until = time.monotonic() + 45.0
         classic = getattr(self, '_classic_retry_event', None)
@@ -111,6 +113,7 @@ class BLEMixin:
         """Configured BLE addresses without a live session."""
         return [normalize_addr(d.address) for d in self.ble_devices
                 if d.address != '*' and normalize_addr(d.address) not in self.sessions
+                and (not hasattr(self, '_reconnect_allowed') or self._reconnect_allowed(d.address, 'ble'))
                 and getattr(self, 'connection_policy', {}).get((normalize_addr(d.address), 'ble')) != 'disconnect']
 
     async def _seed_accept_list(self, missing):
@@ -120,8 +123,7 @@ class BLEMixin:
         await self.device.send_command(
             HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
 
-        known = set(missing) | {a for a in self._keystore_addresses
-                                if a not in self.sessions and getattr(self, 'connection_policy', {}).get((a, 'ble')) != 'disconnect'}
+        known = set(missing)
 
         for addr_str in sorted(known):
             target = Address(addr_str)
@@ -158,7 +160,11 @@ class BLEMixin:
                     continue
 
                 self._mark_ble('seeding_accept_list')
-                known = await self._seed_accept_list(missing)
+                # Policy may have changed while waiting on a physical owner.
+                missing = self._ble_missing_addresses()
+                if not missing:
+                    continue
+                known = set(missing)
 
                 matched_dev = None
                 match_kind = None
@@ -218,7 +224,17 @@ class BLEMixin:
                     value = getattr(params, name, None)
                     if isinstance(value, (int, float)):
                         item[name] = value
-            self._ble_link_events = (getattr(self, '_ble_link_events', []) + [item])[-16:]
+            last_input = getattr(connection, '_hid_last_input_at', None)
+            item['last_input_age_seconds'] = round(max(0, time.monotonic() - last_input), 3) if last_input is not None else None
+            item['classic_active_address'] = getattr(self, '_classic_active_address', None)
+            hci = getattr(getattr(self, 'device', None), 'host', None)
+            item['hci_commands_pending'] = len(getattr(hci, '_command_transactions', ()))
+            item['hci_fault'] = getattr(hci, '_command_fault', None)
+            self._ble_link_events = (getattr(self, '_ble_link_events', []) + [item])[-64:]
+            if event == 'disconnected':
+                log.warning(f'[BLE] Link ended: last_input_age={item["last_input_age_seconds"]}s '
+                            f'reports={item["reports"]} classic_active={item["classic_active_address"]} '
+                            f'hci_pending={item["hci_commands_pending"]} hci_fault={item["hci_fault"]}')
         connection.on('connection_encryption_change', lambda: record('encryption_changed'))
         connection.on('connection_encryption_failure', lambda code: record('encryption_failed', code))
         connection.on('connection_parameters_update', lambda: record('parameters_changed'))
@@ -229,6 +245,10 @@ class BLEMixin:
     def _admit_ble_connection(self, connection, matched_dev=None, match_kind=None):
         """Create a session for a new BLE connection, dropping duplicates."""
         addr = normalize_addr(str(connection.peer_address))
+        identity = normalize_addr(matched_dev.address) if matched_dev is not None else addr
+        if hasattr(self, '_reconnect_allowed') and not self._reconnect_allowed(identity, 'ble'):
+            self._track_task(asyncio.create_task(self._reject_connection(connection)))
+            return
 
         # A connect started before /remove still lands here; without this the
         # session comes back and re-pairs, so the app keeps showing the device.
@@ -250,6 +270,10 @@ class BLEMixin:
         log.info(f"[BLE] Device connected: {self._format_device(addr)}")
         self._observe_ble_link(connection)
         session = self._new_session(addr, Protocol.BLE, connection)
+        session.reconnect_identity = identity
+        policy = getattr(self, 'reconnect_policy', None)
+        if policy is not None:
+            session.reconnect_generation = policy.generation(identity, 'ble')
         session.peer = Peer(connection)
         self._register_session(session)
         session.setup_task = self._track_task(asyncio.create_task(
@@ -340,6 +364,17 @@ class BLEMixin:
 
         self._mark_ble('waiting_radio_lock')
         await self._radio_lock.acquire()
+        if not pairing and hasattr(self, '_ble_missing_addresses'):
+            missing = self._ble_missing_addresses()
+            if not missing:
+                self._radio_lock.release()
+                return None
+            if peer is None:
+                try:
+                    await self._seed_accept_list(missing)
+                except BaseException:
+                    self._radio_lock.release()
+                    raise
         self.device.on(Device.EVENT_CONNECTION, on_connection)
         self.device.on(Device.EVENT_CONNECTION_FAILURE, on_failure)
 
@@ -428,6 +463,10 @@ class BLEMixin:
                              f"{self._format_device(resolved_norm)}")
                     return (dev, 'irk')
 
+        # Names are display labels, not an identity for the persisted last peer.
+        # A changed address needs the peer's IRK resolution above.
+        if getattr(self, 'reconnect_policy', None) is not None:
+            return None
         try:
             name = advertisement.data.get(AdvertisingData.COMPLETE_LOCAL_NAME) or \
                 advertisement.data.get(AdvertisingData.SHORTENED_LOCAL_NAME)
@@ -438,7 +477,7 @@ class BLEMixin:
             name = clean_device_name(name)
         if name:
             dev = next((d for d in self.ble_devices
-                        if d.name == name and d.address not in self.sessions), None)
+                        if d.name == name and d.address in known and d.address not in self.sessions), None)
             if dev:
                 log.info(f"[BLE] {name} advertising from new address {addr_norm}")
                 return (dev, 'name')
@@ -448,15 +487,27 @@ class BLEMixin:
     def _save_rotated_address(self, dev, new_addr: str):
         """Save the new address and drop the device's stale entries."""
         config.add_device(new_addr, Protocol.BLE, dev.name)
-        for old in self.ble_devices:
-            if old.name == dev.name and old.address != new_addr:
-                config.remove_device(old.address)
+        if dev.address != new_addr:
+            config.remove_device(dev.address)
 
     async def _run_ble_scan_handler(self, target_addresses: set):
         """Fallback BLE handler using active scanning for discovery."""
         log.info("[BLE] Scanning for devices...")
+        self._ble_retry_event = asyncio.Event()
 
         while True:
+            policy = getattr(self, 'reconnect_policy', None)
+            if policy is not None:
+                selected = policy.snapshot()
+                target = selected['manual_target'] or selected['last_successful']
+                if not target or target['protocol'] != 'ble' or target['address'] in self.sessions:
+                    try:
+                        await asyncio.wait_for(self._ble_retry_event.wait(), 2.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    self._ble_retry_event.clear()
+                    continue
+                target_addresses = {target['address']}
             found_device = None
             found = asyncio.get_running_loop().create_future()
 

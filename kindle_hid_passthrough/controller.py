@@ -11,6 +11,7 @@ import logging
 import os
 import subprocess
 import threading
+import time
 
 from bt_setup import chip
 from config import Protocol, config, normalize_addr
@@ -81,6 +82,9 @@ class DaemonController:
         conn = self.daemon.connection_state
         status["connections"] = conn.get("connections", [])
         host = self.daemon.host
+        policy = getattr(self.daemon, 'reconnect_policy', None)
+        status['auto_reconnect'] = policy.snapshot() if policy is not None else None
+        status['system_link_events'] = list(getattr(self, '_system_link_events', ()))
         hci_host = getattr(getattr(host, 'device', None), 'host', None)
         hci_fault = getattr(hci_host, '_command_fault', None)
         if hci_fault:
@@ -136,6 +140,10 @@ class DaemonController:
         operation = self.connections.submit(action, address, protocol, request_id, status, dispatch)
         if operation['action'] == 'connect' and operation['reason'] in ('already_ready', 'configuring_hid'):
             self.daemon.connection_policy[(operation['address'], operation['protocol'])] = 'connect'
+            if operation['reason'] == 'already_ready':
+                host = self.daemon.host
+                if host is not None and hasattr(host, '_select_ready_peer'):
+                    host._select_ready_peer(operation['address'], operation['protocol'])
         return operation
 
     async def _finish_connection_disconnect(self, host, address, protocol):
@@ -425,6 +433,8 @@ class DaemonController:
         asyncio.run_coroutine_threadsafe(self._do_system_suspend(event), self.loop)
 
     async def _do_system_suspend(self, event):
+        self._system_link_events = (getattr(self, '_system_link_events', []) +
+                                    [{'event': event, 'at': round(time.monotonic(), 3)}])[-16:]
         async with self._op_lock:
             keeps_radio = chip().survives_suspend
             # A chip that outlives the screensaver keeps serving the remote
@@ -446,6 +456,8 @@ class DaemonController:
         asyncio.run_coroutine_threadsafe(self._do_system_resume(event), self.loop)
 
     async def _do_system_resume(self, event):
+        self._system_link_events = (getattr(self, '_system_link_events', []) +
+                                    [{'event': event, 'at': round(time.monotonic(), 3)}])[-16:]
         async with self._op_lock:
             if not self._suspended_by_system:
                 return
