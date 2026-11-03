@@ -105,6 +105,10 @@ class BLEMixin:
 
     async def _seed_accept_list(self, missing):
         """Load the filter accept list with every address we may connect to."""
+        # Pairing replaces the resolving list, including its per-peer privacy
+        # modes. Reapply our existing policy on the next serial BLE pass.
+        if self.device.address_resolution_offload:
+            await self._set_device_privacy_modes()
         await self.device.send_command(
             HCI_LE_Clear_Filter_Accept_List_Command(), check_result=True)
 
